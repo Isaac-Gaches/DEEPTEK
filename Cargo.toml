@@ -1,0 +1,13 @@
+[package]
+name = "deep_tek"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytemuck = { version = "1.25.0", features = ["derive"] }
+easy-gpu = { path = "vendor/easy-gpu" }
+fontdue = "0.9.4"
+hecs = "0.10.5"
+pollster = "0.4.0"
+rayon = "1.12.0"
+winit = "0.30.13"
