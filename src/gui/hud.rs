@@ -1,7 +1,7 @@
 use super::GuiRenderer;
 
 const MARGIN: f32 = 14.0;
-const STATUS_HEIGHT: f32 = 140.0;
+const STATUS_HEIGHT: f32 = 166.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HudAction {
@@ -35,6 +35,8 @@ pub struct HudSnapshot {
     pub energy: MeterValue,
     pub money: u64,
     pub depth_decimetres: i32,
+    pub delivery_seconds: Option<u32>,
+    pub delivery_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -104,7 +106,6 @@ impl HudGui {
             1.5,
             [0.62, 0.84, 0.94, 1.0],
         );
-
         queue_button(
             renderer,
             layout.contracts,
@@ -120,12 +121,46 @@ impl HudGui {
             [0.16, 0.20, 0.29, 0.96],
         );
     }
+
+    /// A temporary high-contrast banner shown only while a delivery is queued.
+    pub fn queue_delivery_status(
+        self,
+        renderer: &mut GuiRenderer,
+        snapshot: HudSnapshot,
+        viewport: [f32; 2],
+    ) {
+        let Some(seconds) = snapshot.delivery_seconds else {
+            return;
+        };
+        let size = [310.0_f32.min(viewport[0] - MARGIN * 2.0), 48.0];
+        let centre = [MARGIN + size[0] * 0.5, viewport[1] - MARGIN - size[1] * 0.5];
+        renderer.queue_rect(
+            centre,
+            [size[0] + 4.0, size[1] + 4.0],
+            [0.0, 0.82, 0.95, 0.9],
+        );
+        renderer.queue_rect(centre, size, [0.035, 0.075, 0.105, 0.98]);
+        let label = format_delivery_eta(seconds, snapshot.delivery_count);
+        renderer.queue_text(
+            &label,
+            [
+                centre[0] - GuiRenderer::text_width(&label, 1.6) * 0.5,
+                centre[1] - 5.5,
+            ],
+            1.6,
+            [1.0, 0.82, 0.28, 1.0],
+        );
+    }
 }
 
 fn format_depth(depth_decimetres: i32) -> String {
     let sign = if depth_decimetres >= 0 { '+' } else { '-' };
     let magnitude = depth_decimetres.unsigned_abs();
     format!("DEPTH {sign}{}.{:01}M", magnitude / 10, magnitude % 10)
+}
+
+fn format_delivery_eta(seconds: u32, count: usize) -> String {
+    format!("QUEUE {count}   NEXT DROP {seconds}S")
 }
 
 fn queue_meter(
@@ -291,5 +326,11 @@ mod tests {
     fn depth_text_includes_sign_and_single_decimal_place() {
         assert_eq!(format_depth(126), "DEPTH +12.6M");
         assert_eq!(format_depth(-7), "DEPTH -0.7M");
+    }
+
+    #[test]
+    fn delivery_eta_matches_the_terminal_queue_readout() {
+        assert_eq!(format_delivery_eta(5, 1), "QUEUE 1   NEXT DROP 5S");
+        assert_eq!(format_delivery_eta(125, 3), "QUEUE 3   NEXT DROP 125S");
     }
 }

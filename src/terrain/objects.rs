@@ -1,10 +1,10 @@
 use super::{
-    CHUNK_SIZE, ChunkPos, FurnitureObject, FurnitureSupport, NaturalObject, POWERED_CABLE_OBJECT,
-    furniture_definition,
+    CHUNK_SIZE, ChunkPos, FurnitureDefinition, FurnitureObject, FurnitureSupport, NaturalObject,
+    POWERED_CABLE_OBJECT, furniture_definition,
 };
 use crate::items::ItemContainer;
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap, HashMap};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::ops::Bound::{Included, Unbounded};
@@ -44,6 +44,36 @@ pub struct TilePos {
     pub y: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MachineHealth {
+    current: u16,
+    maximum: u16,
+}
+
+impl MachineHealth {
+    pub(super) const fn new(current: u16, maximum: u16) -> Self {
+        Self { current, maximum }
+    }
+
+    pub const fn current(self) -> u16 {
+        self.current
+    }
+
+    pub const fn maximum(self) -> u16 {
+        self.maximum
+    }
+
+    pub const fn is_disabled(self) -> bool {
+        self.current == 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MachineDamage {
+    pub applied: u16,
+    pub disabled: bool,
+}
+
 impl TilePos {
     pub const fn new(x: u32, y: u32) -> Self {
         Self { x, y }
@@ -70,12 +100,36 @@ pub struct WorldObject {
     pub(super) variant: u8,
     pub(super) growth_stage: u8,
     pub(super) active: bool,
+    pub(super) health: u16,
     pub(super) stored_energy_milli: u32,
     pub(super) machine_target_y: u32,
     pub(super) kill_count: u32,
     pub(super) linked_object: u64,
     pub(super) motion_position_milli: u32,
     pub(super) next_update_tick: u64,
+}
+
+/// Complete result of removing one persistent object. Container contents are
+/// transferred out atomically so gameplay code can emit them as world drops
+/// without cloning or losing stacks.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemovedObject {
+    object: WorldObject,
+    contents: Vec<crate::ItemStack>,
+}
+
+impl RemovedObject {
+    pub const fn object(&self) -> &WorldObject {
+        &self.object
+    }
+
+    pub fn contents(&self) -> &[crate::ItemStack] {
+        &self.contents
+    }
+
+    pub fn into_parts(self) -> (WorldObject, Vec<crate::ItemStack>) {
+        (self.object, self.contents)
+    }
 }
 
 impl WorldObject {
@@ -120,6 +174,10 @@ impl WorldObject {
         self.active
     }
 
+    pub const fn health(&self) -> u16 {
+        self.health
+    }
+
     pub const fn stored_energy_milli(&self) -> u32 {
         self.stored_energy_milli
     }
@@ -151,11 +209,21 @@ pub struct DecorationUpdate {
     pub tiles_destroyed: usize,
     pub budget_exhausted: bool,
     pub(super) changed_tiles: Vec<TilePos>,
+    pub(super) detached_objects: Vec<RemovedObject>,
+    pub(super) broken_tiles: Vec<super::BrokenTile>,
 }
 
 impl DecorationUpdate {
     pub fn changed_tiles(&self) -> &[TilePos] {
         &self.changed_tiles
+    }
+
+    pub fn detached_objects(&self) -> &[RemovedObject] {
+        &self.detached_objects
+    }
+
+    pub fn broken_tiles(&self) -> &[super::BrokenTile] {
+        &self.broken_tiles
     }
 }
 
@@ -216,17 +284,28 @@ pub(super) struct GrowthEvent {
     pub(super) object: ObjectId,
 }
 
+const POWER_TOPOLOGY_CHANGE_HISTORY: usize = 4_096;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PowerTopologyChange {
+    pub object: ObjectId,
+    pub object_type: ObjectTypeId,
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct ObjectStore {
     pub(super) objects: Vec<WorldObject>,
     pub(super) next_id: u64,
     revision: u64,
+    spatial_revision: u64,
     item_transport_revision: u64,
     power_revision: u64,
+    power_changes: VecDeque<PowerTopologyChange>,
     by_id: HashMap<ObjectId, usize>,
     by_type: HashMap<ObjectTypeId, Vec<ObjectId>>,
     by_root: HashMap<TilePos, Vec<ObjectId>>,
     occupancy: HashMap<TilePos, ObjectId>,
+    structural_occupancy: HashSet<TilePos>,
     pub(super) containers: HashMap<ObjectId, ItemContainer>,
     cargo_lifts_by_cable: HashMap<ObjectId, ObjectId>,
     lift_stations_by_cable: HashMap<ObjectId, BTreeMap<u32, ObjectId>>,
@@ -253,12 +332,15 @@ impl ObjectStore {
             objects: Vec::new(),
             next_id: 1,
             revision: 0,
+            spatial_revision: 0,
             item_transport_revision: 0,
             power_revision: 0,
+            power_changes: VecDeque::new(),
             by_id: HashMap::new(),
             by_type: HashMap::new(),
             by_root: HashMap::new(),
             occupancy: HashMap::new(),
+            structural_occupancy: HashSet::new(),
             containers: HashMap::new(),
             cargo_lifts_by_cable: HashMap::new(),
             lift_stations_by_cable: HashMap::new(),
@@ -284,6 +366,8 @@ impl ObjectStore {
         }
         let changes_item_transport = affects_item_transport_topology(&object);
         let changes_power = affects_power_topology(&object);
+        let structural = furniture_definition(object.object_type)
+            .is_some_and(FurnitureDefinition::is_structural);
         let lift_station_link = (object.object_type == FurnitureObject::LIFT_STATION)
             .then(|| object.linked_object().map(|cable| (cable, object.anchor.y)))
             .flatten();
@@ -292,6 +376,7 @@ impl ObjectStore {
             .flatten();
         let index = self.objects.len();
         let id = object.id;
+        let object_type = object.object_type;
         self.by_id.insert(id, index);
         self.by_type.entry(object.object_type).or_default().push(id);
         for support in object_support_cells(&object) {
@@ -299,6 +384,9 @@ impl ObjectStore {
         }
         for cell in object_cells(&object) {
             self.occupancy.insert(cell, id);
+            if structural {
+                self.structural_occupancy.insert(cell);
+            }
         }
         for chunk in covered_chunks(&object) {
             let index = (chunk.y * self.chunks_wide + chunk.x) as usize;
@@ -323,11 +411,12 @@ impl ObjectStore {
                 .insert(height, id);
         }
         self.revision = self.revision.wrapping_add(1);
+        self.spatial_revision = self.spatial_revision.wrapping_add(1);
         if changes_item_transport {
             self.item_transport_revision = self.item_transport_revision.wrapping_add(1);
         }
         if changes_power {
-            self.power_revision = self.power_revision.wrapping_add(1);
+            self.record_power_change(id, object_type);
         }
         Ok(())
     }
@@ -340,6 +429,10 @@ impl ObjectStore {
         self.revision
     }
 
+    pub(super) const fn spatial_revision(&self) -> u64 {
+        self.spatial_revision
+    }
+
     pub(super) const fn item_transport_revision(&self) -> u64 {
         self.item_transport_revision
     }
@@ -348,8 +441,43 @@ impl ObjectStore {
         self.power_revision
     }
 
+    pub(super) fn power_changes_since(
+        &self,
+        revision: u64,
+    ) -> Option<impl Iterator<Item = PowerTopologyChange> + '_> {
+        if revision > self.power_revision {
+            return None;
+        }
+        let retained = self.power_changes.len() as u64;
+        let oldest = self
+            .power_revision
+            .saturating_sub(retained)
+            .saturating_add(1);
+        if revision < oldest.saturating_sub(1) {
+            return None;
+        }
+        let skip = revision.saturating_add(1).saturating_sub(oldest) as usize;
+        Some(self.power_changes.iter().skip(skip).copied())
+    }
+
+    fn record_power_change(&mut self, object: ObjectId, object_type: ObjectTypeId) {
+        self.power_revision = self.power_revision.saturating_add(1);
+        if self.power_changes.len() == POWER_TOPOLOGY_CHANGE_HISTORY {
+            self.power_changes.pop_front();
+        }
+        self.power_changes.push_back(PowerTopologyChange {
+            object,
+            object_type,
+        });
+    }
+
     pub(super) fn mark_changed(&mut self) {
         self.revision = self.revision.wrapping_add(1);
+    }
+
+    pub(super) fn mark_spatial_changed(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+        self.spatial_revision = self.spatial_revision.wrapping_add(1);
     }
 
     pub(super) fn object_mut(&mut self, id: ObjectId) -> Option<&mut WorldObject> {
@@ -459,15 +587,51 @@ impl ObjectStore {
         });
     }
 
-    pub(super) fn remove_rooted_at(&mut self, position: TilePos) -> usize {
+    pub(super) fn remove_rooted_at(&mut self, position: TilePos) -> Vec<RemovedObject> {
         let Some(objects) = self.by_root.get(&position).cloned() else {
-            return 0;
+            return Vec::new();
         };
-        let count = objects.len();
+        let mut removed = Vec::new();
         for object in objects {
-            self.remove(object);
+            removed.extend(self.remove_with_dependents(object));
         }
-        count
+        removed
+    }
+
+    /// Removes furniture rooted on any occupied cell before removing the support.
+    /// The root index bounds this to the actual dependency tree rather than all objects.
+    pub(super) fn remove_with_dependents(&mut self, id: ObjectId) -> Vec<RemovedObject> {
+        let Some(cells) = self
+            .object(id)
+            .map(|object| object_cells(object).collect::<Vec<_>>())
+        else {
+            return Vec::new();
+        };
+        let mut removed = Vec::new();
+        for cell in cells {
+            let Some(dependents) = self.by_root.get(&cell).cloned() else {
+                continue;
+            };
+            for dependent in dependents {
+                if dependent != id {
+                    removed.extend(self.remove_with_dependents(dependent));
+                }
+            }
+        }
+        if let Some(object) = self.remove(id) {
+            removed.push(object);
+        }
+        removed
+    }
+
+    pub(super) fn has_dependents(&self, id: ObjectId) -> bool {
+        self.object(id).is_some_and(|object| {
+            object_cells(object).any(|cell| {
+                self.by_root
+                    .get(&cell)
+                    .is_some_and(|objects| objects.iter().any(|&candidate| candidate != id))
+            })
+        })
     }
 
     pub(super) fn remove_grass_dependent_rooted_at(&mut self, position: TilePos) -> usize {
@@ -497,18 +661,18 @@ impl ObjectStore {
         self.remove(object).is_some()
     }
 
-    pub(super) fn remove(&mut self, id: ObjectId) -> Option<WorldObject> {
-        if self
-            .containers
-            .get(&id)
-            .is_some_and(|container| !container.is_empty())
-        {
-            return None;
-        }
+    pub(super) fn remove(&mut self, id: ObjectId) -> Option<RemovedObject> {
         let index = self.by_id.remove(&id)?;
         let object = self.objects.swap_remove(index);
+        let contents = self
+            .containers
+            .remove(&id)
+            .map(|container| container.slots().iter().flatten().copied().collect())
+            .unwrap_or_default();
         let changes_item_transport = affects_item_transport_topology(&object);
         let changes_power = affects_power_topology(&object);
+        let structural = furniture_definition(object.object_type)
+            .is_some_and(FurnitureDefinition::is_structural);
         if index < self.objects.len() {
             self.by_id.insert(self.objects[index].id, index);
         }
@@ -545,6 +709,9 @@ impl ObjectStore {
         }
         for cell in object_cells(&object) {
             self.occupancy.remove(&cell);
+            if structural {
+                self.structural_occupancy.remove(&cell);
+            }
         }
         for chunk in covered_chunks(&object) {
             let chunk_index = (chunk.y * self.chunks_wide + chunk.x) as usize;
@@ -553,14 +720,14 @@ impl ObjectStore {
             }
         }
         self.revision = self.revision.wrapping_add(1);
+        self.spatial_revision = self.spatial_revision.wrapping_add(1);
         if changes_item_transport {
             self.item_transport_revision = self.item_transport_revision.wrapping_add(1);
         }
         if changes_power {
-            self.power_revision = self.power_revision.wrapping_add(1);
+            self.record_power_change(id, object.object_type);
         }
-        self.containers.remove(&id);
-        Some(object)
+        Some(RemovedObject { object, contents })
     }
 
     pub(super) fn has_non_empty_container_rooted_at(&self, position: TilePos) -> Option<ObjectId> {
@@ -569,6 +736,11 @@ impl ObjectStore {
                 .get(id)
                 .is_some_and(|container| !container.is_empty())
         })
+    }
+
+    #[inline]
+    pub(super) fn structural_at(&self, position: TilePos) -> bool {
+        !self.structural_occupancy.is_empty() && self.structural_occupancy.contains(&position)
     }
 
     pub(super) fn pop_due(&mut self, current_tick: u64) -> Option<GrowthEvent> {
@@ -634,15 +806,44 @@ impl ObjectStore {
         .chunk();
         let new_chunk = new_cell.chunk();
         self.objects[index].height += 1;
+        let object_type = self.objects[index].object_type;
         self.occupancy.insert(new_cell, id);
         self.revision = self.revision.wrapping_add(1);
         if changes_power {
-            self.power_revision = self.power_revision.wrapping_add(1);
+            self.record_power_change(id, object_type);
         }
         if new_chunk != old_last_chunk {
             let chunk_index = (new_chunk.y * self.chunks_wide + new_chunk.x) as usize;
             if let Some(objects) = self.by_chunk.get_mut(chunk_index) {
                 objects.push(id);
+            }
+        }
+        true
+    }
+
+    pub(super) fn merge_down(&mut self, upper: ObjectId, lower: ObjectId) -> bool {
+        let Some(upper_object) = self.object(upper) else {
+            return false;
+        };
+        let Some(lower_object) = self.object(lower) else {
+            return false;
+        };
+        if upper == lower
+            || upper_object.object_type != lower_object.object_type
+            || upper_object.anchor.x != lower_object.anchor.x
+            || upper_object.anchor.y + u32::from(upper_object.height) != lower_object.anchor.y
+        {
+            return false;
+        }
+        let lower_height = lower_object.height;
+        if self.remove(lower).is_none() {
+            return false;
+        }
+        for _ in 0..lower_height {
+            let extended = self.extend_down(upper);
+            debug_assert!(extended, "validated vertical object merge must extend");
+            if !extended {
+                return false;
             }
         }
         true

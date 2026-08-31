@@ -185,6 +185,10 @@ impl Health {
         }
     }
 
+    pub fn with_current(current: u16, maximum: u16) -> Option<Self> {
+        (maximum > 0 && current <= maximum).then_some(Self { current, maximum })
+    }
+
     pub const fn current(self) -> u16 {
         self.current
     }
@@ -291,5 +295,12 @@ mod resource_tests {
         assert!(wallet.withdraw(10));
         wallet.deposit(u64::MAX);
         assert_eq!(wallet.money(), u64::MAX);
+    }
+
+    #[test]
+    fn health_can_be_restored_from_valid_saved_parts() {
+        assert_eq!(Health::with_current(37, 100).unwrap().current(), 37);
+        assert_eq!(Health::with_current(101, 100), None);
+        assert_eq!(Health::with_current(0, 0), None);
     }
 }

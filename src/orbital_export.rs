@@ -61,11 +61,13 @@ impl OrbitalExportSystem {
         self.launcher_ids.extend(
             world
                 .objects_of_type(FurnitureObject::ORBITAL_EXPORT_LAUNCHER)
+                .filter(|object| object.is_active())
                 .map(|object| object.id()),
         );
         self.next_launch.retain(|id, _| {
             world.object(*id).is_some_and(|object| {
                 object.object_type() == FurnitureObject::ORBITAL_EXPORT_LAUNCHER
+                    && object.is_active()
             })
         });
 
@@ -115,7 +117,7 @@ mod tests {
     use crate::{ForegroundTile, ItemId, Layer, TilePos};
 
     fn launcher_world() -> (World, ObjectId, PowerSystem) {
-        let mut world = World::empty(12, 36, 0).unwrap();
+        let mut world = World::empty(12, 120, 0).unwrap();
         for x in 3..=10 {
             world
                 .set_tile(x, 12, Layer::Foreground, ForegroundTile::STONE)
@@ -243,20 +245,21 @@ mod tests {
     }
 
     #[test]
-    fn launcher_below_zero_elevation_has_no_sky_access() {
-        let mut world = World::empty(12, 36, 0).unwrap();
+    fn launcher_below_minus_one_hundred_metres_has_no_sky_access() {
+        let mut world = World::empty(12, 300, 0).unwrap();
         for x in 3..=5 {
             world
-                .set_tile(x, 20, Layer::Foreground, ForegroundTile::STONE)
+                .set_tile(x, 190, Layer::Foreground, ForegroundTile::STONE)
                 .unwrap();
         }
         let launcher = world
             .place_furniture(
                 FurnitureObject::ORBITAL_EXPORT_LAUNCHER,
-                TilePos::new(3, 17),
+                TilePos::new(3, 187),
             )
             .unwrap();
 
+        assert!(world.elevation_decimetres(189.0) < -1_000);
         assert!(!world.orbital_export_has_sky_access(launcher));
     }
 }

@@ -62,6 +62,19 @@ impl ItemRegistry {
             places_object.then_some(definition.id)
         })
     }
+
+    pub fn item_for_tile(&self, layer: Layer, tile: TileId) -> Option<ItemId> {
+        self.definitions().find_map(|definition| {
+            matches!(
+                definition.action,
+                ItemAction::PlaceTile {
+                    layer: candidate_layer,
+                    tile: candidate_tile,
+                } if candidate_layer == layer && candidate_tile == tile
+            )
+            .then_some(definition.id)
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -87,7 +100,7 @@ impl Error for ItemRegistryError {}
 
 /// Definitions installed by `ItemRegistry::with_built_ins`. Keeping this as a
 /// public constructor makes a game's content bootstrap explicit and testable.
-pub fn built_in_item_definitions() -> [ItemDefinition; 21] {
+pub fn built_in_item_definitions() -> [ItemDefinition; 36] {
     [
         ItemDefinition::block(
             ItemId::DIRT_BLOCK,
@@ -121,7 +134,9 @@ pub fn built_in_item_definitions() -> [ItemDefinition; 21] {
             1,
             ItemAction::Tool(ToolAction::RemoveTile {
                 layer: Layer::Foreground,
-                power: 1,
+                // Eight pulses break a 40-health stone block. At the 75 ms
+                // held-use interval this is approximately 0.525 seconds.
+                power: 10,
             }),
         )
         .with_export_value(40),
@@ -300,6 +315,161 @@ pub fn built_in_item_definitions() -> [ItemDefinition; 21] {
             },
         )
         .with_export_value(40),
+        ItemDefinition::new(
+            ItemId::HARDENED_COMPOSITE,
+            "Hardened Composite",
+            ItemCategory::Material,
+            999,
+            4,
+            ItemAction::None,
+        )
+        .with_export_value(12),
+        ItemDefinition::new(
+            ItemId::COMPOSITE_ASSEMBLER,
+            "Resource Processor",
+            ItemCategory::Furniture,
+            99,
+            13,
+            ItemAction::PlaceFurniture {
+                object_type: FurnitureObject::COMPOSITE_ASSEMBLER,
+            },
+        )
+        .with_export_value(1_100),
+        ItemDefinition::new(
+            ItemId::RED_SHAFT_BORE,
+            "Red Shaft Bore",
+            ItemCategory::Furniture,
+            99,
+            7,
+            ItemAction::PlaceFurniture {
+                object_type: FurnitureObject::RED_SHAFT_BORE,
+            },
+        )
+        .with_export_value(2_400),
+        ItemDefinition::new(
+            ItemId::PROCUREMENT_TERMINAL,
+            "Procurement Terminal",
+            ItemCategory::Furniture,
+            99,
+            13,
+            ItemAction::PlaceFurniture {
+                object_type: FurnitureObject::PROCUREMENT_TERMINAL,
+            },
+        )
+        .with_export_value(500),
+        ItemDefinition::new(
+            ItemId::LASER_DRILL,
+            "Laser Drill",
+            ItemCategory::Furniture,
+            99,
+            7,
+            ItemAction::PlaceFurniture {
+                object_type: FurnitureObject::LASER_DRILL,
+            },
+        )
+        .with_export_value(1_600),
+        ItemDefinition::new(
+            ItemId::AMMO_TURRET,
+            "Autocannon Turret",
+            ItemCategory::Furniture,
+            99,
+            8,
+            ItemAction::PlaceFurniture {
+                object_type: FurnitureObject::AMMO_TURRET,
+            },
+        )
+        .with_export_value(1_150),
+        ItemDefinition::new(
+            ItemId::DIRECTIONAL_SENTRY,
+            "Directional Sentry",
+            ItemCategory::Furniture,
+            99,
+            8,
+            ItemAction::PlaceFurniture {
+                object_type: FurnitureObject::DIRECTIONAL_SENTRY,
+            },
+        )
+        .with_export_value(600),
+        ItemDefinition::new(
+            ItemId::TURRET_AMMO,
+            "Ballistic Rounds",
+            ItemCategory::Material,
+            999,
+            0,
+            ItemAction::None,
+        )
+        .with_export_value(3),
+        ItemDefinition::new(
+            ItemId::SPIKES,
+            "Spikes",
+            ItemCategory::Furniture,
+            999,
+            0,
+            ItemAction::PlaceFurniture {
+                object_type: FurnitureObject::SPIKES,
+            },
+        )
+        .with_export_value(8),
+        ItemDefinition::new(
+            ItemId::DOOR,
+            "Settlement Door",
+            ItemCategory::Furniture,
+            99,
+            6,
+            ItemAction::PlaceFurniture {
+                object_type: FurnitureObject::DOOR,
+            },
+        )
+        .with_export_value(60),
+        ItemDefinition::new(
+            ItemId::BED,
+            "Settlement Bed",
+            ItemCategory::Furniture,
+            99,
+            13,
+            ItemAction::PlaceFurniture {
+                object_type: FurnitureObject::BED,
+            },
+        )
+        .with_export_value(80),
+        ItemDefinition::new(
+            ItemId::IRON_ORE,
+            "Iron Ore",
+            ItemCategory::Material,
+            999,
+            4,
+            ItemAction::None,
+        )
+        .with_export_value(10),
+        ItemDefinition::new(
+            ItemId::SUBSURFACE_SURVEYOR,
+            "Subsurface Surveyor",
+            ItemCategory::Furniture,
+            99,
+            13,
+            ItemAction::PlaceFurniture {
+                object_type: FurnitureObject::SUBSURFACE_SURVEYOR,
+            },
+        )
+        .with_export_value(1_000),
+        ItemDefinition::new(
+            ItemId::IRON_INGOT,
+            "Iron Ingot",
+            ItemCategory::Material,
+            999,
+            4,
+            ItemAction::None,
+        )
+        .with_export_value(25),
+        ItemDefinition::new(
+            ItemId::ASTERITE,
+            "Asterite",
+            ItemCategory::Material,
+            999,
+            4,
+            ItemAction::None,
+        )
+        .with_export_value(1_000),
     ]
 }
 
@@ -351,6 +521,18 @@ mod tests {
     }
 
     #[test]
+    fn copper_pickaxe_is_tuned_for_roughly_half_second_stone_mining() {
+        let registry = ItemRegistry::with_built_ins();
+        assert_eq!(
+            registry.get(ItemId::PICKAXE).unwrap().action,
+            ItemAction::Tool(ToolAction::RemoveTile {
+                layer: Layer::Foreground,
+                power: 10,
+            })
+        );
+    }
+
+    #[test]
     fn rope_and_furniture_support_held_placement() {
         let registry = ItemRegistry::with_built_ins();
         let rope = registry.get(ItemId::ROPE).unwrap();
@@ -368,6 +550,8 @@ mod tests {
         let lift = registry.get(ItemId::CARGO_LIFT).unwrap();
         let station = registry.get(ItemId::LIFT_STATION).unwrap();
         let connector = registry.get(ItemId::POWER_CONNECTOR).unwrap();
+        let assembler = registry.get(ItemId::COMPOSITE_ASSEMBLER).unwrap();
+        let red_bore = registry.get(ItemId::RED_SHAFT_BORE).unwrap();
         assert!(matches!(
             powered_cable.action,
             ItemAction::PlacePoweredCable
@@ -385,6 +569,22 @@ mod tests {
             connector.action,
             ItemAction::PlaceFurniture {
                 object_type: FurnitureObject::POWER_CONNECTOR
+            }
+        ));
+        assert!(matches!(
+            assembler.action,
+            ItemAction::PlaceFurniture {
+                object_type: FurnitureObject::COMPOSITE_ASSEMBLER
+            }
+        ));
+        assert_eq!(
+            registry.get(ItemId::HARDENED_COMPOSITE).unwrap().category,
+            ItemCategory::Material
+        );
+        assert!(matches!(
+            red_bore.action,
+            ItemAction::PlaceFurniture {
+                object_type: FurnitureObject::RED_SHAFT_BORE
             }
         ));
     }

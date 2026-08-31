@@ -18,6 +18,16 @@ impl FurnitureObject {
     pub const CARGO_LIFT: ObjectTypeId = ObjectTypeId::new(265);
     pub const LIFT_STATION: ObjectTypeId = ObjectTypeId::new(266);
     pub const POWER_CONNECTOR: ObjectTypeId = ObjectTypeId::new(267);
+    pub const COMPOSITE_ASSEMBLER: ObjectTypeId = ObjectTypeId::new(268);
+    pub const RED_SHAFT_BORE: ObjectTypeId = ObjectTypeId::new(269);
+    pub const PROCUREMENT_TERMINAL: ObjectTypeId = ObjectTypeId::new(270);
+    pub const LASER_DRILL: ObjectTypeId = ObjectTypeId::new(271);
+    pub const AMMO_TURRET: ObjectTypeId = ObjectTypeId::new(272);
+    pub const DIRECTIONAL_SENTRY: ObjectTypeId = ObjectTypeId::new(273);
+    pub const SPIKES: ObjectTypeId = ObjectTypeId::new(274);
+    pub const DOOR: ObjectTypeId = ObjectTypeId::new(275);
+    pub const BED: ObjectTypeId = ObjectTypeId::new(276);
+    pub const SUBSURFACE_SURVEYOR: ObjectTypeId = ObjectTypeId::new(277);
 }
 
 pub const LASER_BORE_MAX_LENGTH: u32 = 400;
@@ -31,11 +41,26 @@ pub const SOLAR_GENERATION_MILLI_PER_SECOND: u32 = 12_000;
 pub const LASER_BORE_DEMAND_MILLI_PER_SECOND: u32 = 8_000;
 pub const ORBITAL_EXPORT_DEMAND_MILLI_PER_SECOND: u32 = 4_000;
 pub const TURRET_DEMAND_MILLI_PER_SECOND: u32 = 6_000;
+pub const AMMO_TURRET_DEMAND_MILLI_PER_SECOND: u32 = 4_000;
+pub const AMMO_TURRET_SLOTS: u16 = 4;
+pub const DIRECTIONAL_SENTRY_DEMAND_MILLI_PER_SECOND: u32 = 2_500;
 pub const BATTERY_CAPACITY_MILLI: u32 = 480_000;
 pub const CARGO_LIFT_SLOTS: u16 = 20;
 pub const CARGO_LIFT_DEMAND_MILLI_PER_SECOND: u32 = 10_000;
 pub const CARGO_LIFT_SPEED_MILLI_TILES_PER_SECOND: u32 = 6_000;
 pub const LIFT_STATION_SLOTS: u16 = 20;
+pub const COMPOSITE_ASSEMBLER_SLOTS: u16 = 3;
+pub const COMPOSITE_ASSEMBLER_DEMAND_MILLI_PER_SECOND: u32 = 7_000;
+pub const RED_SHAFT_BORE_WIDTH: u32 = 4;
+pub const RED_SHAFT_BORE_SLOTS: u16 = 40;
+pub const RED_SHAFT_BORE_DEMAND_MILLI_PER_SECOND: u32 = 24_000;
+pub const LASER_DRILL_MAX_LENGTH: u32 = 160;
+pub const LASER_DRILL_SLOTS: u16 = 10;
+pub const LASER_DRILL_DEMAND_MILLI_PER_SECOND: u32 = 12_000;
+pub const SUBSURFACE_SURVEY_WIDTH: u32 = 64;
+pub const SUBSURFACE_SURVEY_DEPTH: u32 = 1_000;
+pub const SUBSURFACE_SURVEYOR_DEMAND_MILLI_PER_SECOND: u32 = 3_000;
+pub const PROCUREMENT_TERMINAL_DEMAND_MILLI_PER_SECOND: u32 = 1_000;
 
 /// Declares how furniture participates in the sparse power graph.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,6 +81,8 @@ pub enum ItemTransportRole {
     Output,
     /// Input-only machinery, such as the orbital export launcher.
     Input,
+    /// Two-input machines expose recipe inputs and their output separately.
+    Processor,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -103,6 +130,129 @@ impl TargetPriority {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FurnitureConfiguration {
     TargetPriority,
+    LaserAim,
+}
+
+const FACING_LEFT_FLAG: u8 = 1 << 7;
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum FurnitureFacing {
+    Left,
+    #[default]
+    Right,
+}
+
+impl FurnitureFacing {
+    pub const fn horizontal_sign(self) -> f32 {
+        match self {
+            Self::Left => -1.0,
+            Self::Right => 1.0,
+        }
+    }
+
+    pub(crate) const fn from_variant(variant: u8) -> Self {
+        if variant & FACING_LEFT_FLAG == 0 {
+            Self::Right
+        } else {
+            Self::Left
+        }
+    }
+
+    pub(crate) const fn apply_to_variant(self, variant: u8) -> u8 {
+        match self {
+            Self::Left => variant | FACING_LEFT_FLAG,
+            Self::Right => variant & !FACING_LEFT_FLAG,
+        }
+    }
+}
+
+pub(crate) const fn configuration_variant(variant: u8) -> u8 {
+    variant & !FACING_LEFT_FLAG
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+#[repr(u8)]
+pub enum LaserDrillAim {
+    FarLeft = 0,
+    Left = 1,
+    SlightLeft = 2,
+    #[default]
+    Down = 3,
+    SlightRight = 4,
+    Right = 5,
+    FarRight = 6,
+}
+
+impl LaserDrillAim {
+    pub const ALL: [Self; 7] = [
+        Self::FarLeft,
+        Self::Left,
+        Self::SlightLeft,
+        Self::Down,
+        Self::SlightRight,
+        Self::Right,
+        Self::FarRight,
+    ];
+
+    pub const fn raw(self) -> u8 {
+        self as u8
+    }
+
+    pub const fn from_raw(raw: u8) -> Option<Self> {
+        match raw {
+            0 => Some(Self::FarLeft),
+            1 => Some(Self::Left),
+            2 => Some(Self::SlightLeft),
+            3 => Some(Self::Down),
+            4 => Some(Self::SlightRight),
+            5 => Some(Self::Right),
+            6 => Some(Self::FarRight),
+            _ => None,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::FarLeft => "63L",
+            Self::Left => "45L",
+            Self::SlightLeft => "27L",
+            Self::Down => "DOWN",
+            Self::SlightRight => "27R",
+            Self::Right => "45R",
+            Self::FarRight => "63R",
+        }
+    }
+
+    pub const fn direction(self) -> [i32; 2] {
+        match self {
+            Self::FarLeft => [-2, 1],
+            Self::Left => [-1, 1],
+            Self::SlightLeft => [-1, 2],
+            Self::Down => [0, 1],
+            Self::SlightRight => [1, 2],
+            Self::Right => [1, 1],
+            Self::FarRight => [2, 1],
+        }
+    }
+
+    pub(crate) fn tile_offset(self, step: u32) -> [i32; 2] {
+        let [x, y] = self.direction();
+        let divisor = x.unsigned_abs().max(y.unsigned_abs()).max(1) as i64;
+        let step = i64::from(step);
+        [
+            rounded_ratio(i64::from(x) * step, divisor),
+            rounded_ratio(i64::from(y) * step, divisor),
+        ]
+    }
+}
+
+fn rounded_ratio(value: i64, divisor: i64) -> i32 {
+    let magnitude = (value.unsigned_abs() + divisor as u64 / 2) / divisor as u64;
+    if value < 0 {
+        -(magnitude as i32)
+    } else {
+        magnitude as i32
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -221,6 +371,25 @@ pub(crate) struct LaserBoreBeam {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RedShaftBoreBeam {
+    pub(crate) first_x: u32,
+    pub(crate) width: u32,
+    pub(crate) first_y: u32,
+    pub(crate) length_tiles: u32,
+    pub(crate) target_y: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct LaserDrillBeam {
+    pub(crate) origin: [f32; 2],
+    pub(crate) endpoint: [f32; 2],
+    pub(crate) first_tile: super::TilePos,
+    pub(crate) steps: u32,
+    pub(crate) aim: LaserDrillAim,
+    pub(crate) target: Option<super::TilePos>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FurnitureSupport {
     /// Every tile directly below the footprint must contain foreground terrain.
     Floor,
@@ -253,9 +422,13 @@ pub struct FurnitureInteraction {
     item_transport_role: Option<ItemTransportRole>,
     power_storage_status: bool,
     drill_depth_status: bool,
+    subsurface_survey_status: bool,
     kill_count_status: bool,
     lift_controls: bool,
     lift_station_controls: bool,
+    procurement_terminal: bool,
+    door: bool,
+    bed: bool,
 }
 
 impl FurnitureInteraction {
@@ -266,9 +439,13 @@ impl FurnitureInteraction {
         item_transport_role: None,
         power_storage_status: false,
         drill_depth_status: false,
+        subsurface_survey_status: false,
         kill_count_status: false,
         lift_controls: false,
         lift_station_controls: false,
+        procurement_terminal: false,
+        door: false,
+        bed: false,
     };
 
     /// Creates a storage interaction without coupling the object store or UI to
@@ -285,9 +462,13 @@ impl FurnitureInteraction {
             item_transport_role: Some(role),
             power_storage_status: false,
             drill_depth_status: false,
+            subsurface_survey_status: false,
             kill_count_status: false,
             lift_controls: false,
             lift_station_controls: false,
+            procurement_terminal: false,
+            door: false,
+            bed: false,
         }
     }
 
@@ -305,10 +486,19 @@ impl FurnitureInteraction {
             item_transport_role: Some(role),
             power_storage_status: false,
             drill_depth_status: false,
+            subsurface_survey_status: false,
             kill_count_status: false,
             lift_controls: false,
             lift_station_controls: false,
+            procurement_terminal: false,
+            door: false,
+            bed: false,
         }
+    }
+
+    pub const fn with_configuration(mut self, configuration: FurnitureConfiguration) -> Self {
+        self.configuration = Some(configuration);
+        self
     }
 
     /// Creates an activatable machine with a reusable configuration control
@@ -322,9 +512,20 @@ impl FurnitureInteraction {
             item_transport_role: None,
             power_storage_status: false,
             drill_depth_status: false,
+            subsurface_survey_status: false,
             kill_count_status: false,
             lift_controls: false,
             lift_station_controls: false,
+            procurement_terminal: false,
+            door: false,
+            bed: false,
+        }
+    }
+
+    pub const fn activatable_machine() -> Self {
+        Self {
+            activatable: true,
+            ..Self::NONE
         }
     }
 
@@ -336,9 +537,13 @@ impl FurnitureInteraction {
             item_transport_role: None,
             power_storage_status: true,
             drill_depth_status: false,
+            subsurface_survey_status: false,
             kill_count_status: false,
             lift_controls: false,
             lift_station_controls: false,
+            procurement_terminal: false,
+            door: false,
+            bed: false,
         }
     }
 
@@ -353,14 +558,55 @@ impl FurnitureInteraction {
             item_transport_role: None,
             power_storage_status: false,
             drill_depth_status: false,
+            subsurface_survey_status: false,
             kill_count_status: false,
             lift_controls: false,
             lift_station_controls: false,
+            procurement_terminal: false,
+            door: false,
+            bed: false,
+        }
+    }
+
+    pub const fn procurement_terminal() -> Self {
+        Self {
+            container_slots: None,
+            activatable: false,
+            configuration: None,
+            item_transport_role: None,
+            power_storage_status: false,
+            drill_depth_status: false,
+            subsurface_survey_status: false,
+            kill_count_status: false,
+            lift_controls: false,
+            lift_station_controls: false,
+            procurement_terminal: true,
+            door: false,
+            bed: false,
+        }
+    }
+
+    pub const fn door() -> Self {
+        Self {
+            door: true,
+            ..Self::NONE
+        }
+    }
+
+    pub const fn bed() -> Self {
+        Self {
+            bed: true,
+            ..Self::NONE
         }
     }
 
     pub const fn with_drill_depth_status(mut self) -> Self {
         self.drill_depth_status = true;
+        self
+    }
+
+    pub const fn with_subsurface_survey_status(mut self) -> Self {
+        self.subsurface_survey_status = true;
         self
     }
 
@@ -403,6 +649,10 @@ impl FurnitureInteraction {
         self.drill_depth_status
     }
 
+    pub const fn shows_subsurface_survey(self) -> bool {
+        self.subsurface_survey_status
+    }
+
     pub const fn shows_kill_count(self) -> bool {
         self.kill_count_status
     }
@@ -415,15 +665,31 @@ impl FurnitureInteraction {
         self.lift_station_controls
     }
 
+    pub const fn opens_procurement(self) -> bool {
+        self.procurement_terminal
+    }
+
+    pub const fn toggles_door(self) -> bool {
+        self.door
+    }
+
+    pub const fn allows_sleep(self) -> bool {
+        self.bed
+    }
+
     pub const fn is_interactive(self) -> bool {
         self.container_slots.is_some()
             || self.activatable
             || self.configuration.is_some()
             || self.power_storage_status
             || self.drill_depth_status
+            || self.subsurface_survey_status
             || self.kill_count_status
             || self.lift_controls
             || self.lift_station_controls
+            || self.procurement_terminal
+            || self.door
+            || self.bed
     }
 }
 
@@ -431,6 +697,16 @@ impl FurnitureInteraction {
 /// Adding another built-in furniture type only requires another definition;
 /// the world object, occupancy, persistence, item-use, and rendering paths all
 /// use these generic dimensions and support rules.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChunkActivity {
+    None,
+    Local,
+    Nearby,
+}
+
+pub const DEFAULT_MACHINE_HEALTH: u16 = 200;
+const LIFEFORM_ATTENTION_POWER_STEP_MILLI_PER_SECOND: u32 = 4_000;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FurnitureDefinition {
     object_type: ObjectTypeId,
@@ -440,6 +716,9 @@ pub struct FurnitureDefinition {
     interaction: FurnitureInteraction,
     sprite_frame: u16,
     item_transport_connector: bool,
+    chunk_activity: ChunkActivity,
+    maximum_health: u16,
+    lifeform_attention: u32,
     power_role: Option<PowerRole>,
     /// Socket offset from the anchor in half-tile units. Integer storage keeps
     /// definitions const-friendly and exactly comparable.
@@ -448,6 +727,10 @@ pub struct FurnitureDefinition {
     power_capacity_milli: u32,
     power_connection_range_half_tiles: u16,
     power_connection_limit: u16,
+    supports_facing: bool,
+    structural: bool,
+    room_boundary: bool,
+    noise_emission: u16,
 }
 
 impl FurnitureDefinition {
@@ -467,17 +750,40 @@ impl FurnitureDefinition {
             interaction,
             sprite_frame,
             item_transport_connector: false,
+            chunk_activity: ChunkActivity::None,
+            maximum_health: 0,
+            lifeform_attention: 0,
             power_role: None,
             power_socket_half_tiles: [0; 2],
             power_rate_milli_per_second: 0,
             power_capacity_milli: 0,
             power_connection_range_half_tiles: 0,
             power_connection_limit: 0,
+            supports_facing: false,
+            structural: false,
+            room_boundary: false,
+            noise_emission: 0,
         }
     }
 
     pub const fn with_item_transport_connector(mut self) -> Self {
         self.item_transport_connector = true;
+        self
+    }
+
+    /// Marks working machinery as a simulation anchor for nearby chunks.
+    pub const fn with_chunk_activity(mut self) -> Self {
+        self.chunk_activity = ChunkActivity::Nearby;
+        self.maximum_health = DEFAULT_MACHINE_HEALTH;
+        // Footprint is the baseline industrial signature, so physically larger
+        // machines draw more attention without requiring spawner-side type checks.
+        self.lifeform_attention = self.size[0] as u32 * self.size[1] as u32;
+        self
+    }
+
+    /// Keeps only the chunks occupied by passive infrastructure simulated.
+    pub const fn with_local_chunk_activity(mut self) -> Self {
+        self.chunk_activity = ChunkActivity::Local;
         self
     }
 
@@ -502,11 +808,43 @@ impl FurnitureDefinition {
 
     pub const fn with_power_rate(mut self, milli_per_second: u32) -> Self {
         self.power_rate_milli_per_second = milli_per_second;
+        if matches!(self.chunk_activity, ChunkActivity::Nearby) && milli_per_second > 0 {
+            self.lifeform_attention = self.lifeform_attention.saturating_add(
+                milli_per_second.saturating_add(LIFEFORM_ATTENTION_POWER_STEP_MILLI_PER_SECOND - 1)
+                    / LIFEFORM_ATTENTION_POWER_STEP_MILLI_PER_SECOND,
+            );
+        }
         self
     }
 
     pub const fn with_power_capacity(mut self, milli: u32) -> Self {
         self.power_capacity_milli = milli;
+        self
+    }
+
+    pub const fn with_facing(mut self) -> Self {
+        self.supports_facing = true;
+        self
+    }
+
+    /// Makes every occupied cell solid and eligible as placement support.
+    /// Collision and placement resolve this through the world's object cell index.
+    pub const fn with_structural_collision(mut self) -> Self {
+        self.structural = true;
+        self
+    }
+
+    /// Marks furniture cells as closed boundaries for bounded room discovery.
+    /// This is separate from collision so an animated/openable door can later
+    /// change traversal without changing the housing representation.
+    pub const fn with_room_boundary(mut self) -> Self {
+        self.room_boundary = true;
+        self
+    }
+
+    /// Declares definition-driven industrial noise for specialist happiness.
+    pub const fn with_noise_emission(mut self, noise: u16) -> Self {
+        self.noise_emission = noise;
         self
     }
 
@@ -538,6 +876,24 @@ impl FurnitureDefinition {
         self.item_transport_connector
     }
 
+    pub const fn chunk_activity(self) -> ChunkActivity {
+        self.chunk_activity
+    }
+
+    pub const fn maximum_health(self) -> Option<u16> {
+        if self.maximum_health == 0 {
+            None
+        } else {
+            Some(self.maximum_health)
+        }
+    }
+
+    /// Relative amount of hostile attention generated while this machine is active.
+    /// Passive infrastructure deliberately returns zero.
+    pub const fn lifeform_attention(self) -> u32 {
+        self.lifeform_attention
+    }
+
     pub const fn power_role(self) -> Option<PowerRole> {
         self.power_role
     }
@@ -564,6 +920,22 @@ impl FurnitureDefinition {
     pub const fn power_connection_limit(self) -> u16 {
         self.power_connection_limit
     }
+
+    pub const fn supports_facing(self) -> bool {
+        self.supports_facing
+    }
+
+    pub const fn is_structural(self) -> bool {
+        self.structural
+    }
+
+    pub const fn is_room_boundary(self) -> bool {
+        self.room_boundary
+    }
+
+    pub const fn noise_emission(self) -> u16 {
+        self.noise_emission
+    }
 }
 
 pub const CHEST_DEFINITION: FurnitureDefinition = FurnitureDefinition::new(
@@ -573,7 +945,8 @@ pub const CHEST_DEFINITION: FurnitureDefinition = FurnitureDefinition::new(
     FurnitureSupport::Floor,
     FurnitureInteraction::container(40),
     0,
-);
+)
+.with_local_chunk_activity();
 
 pub const LASER_BORE_DEFINITION: FurnitureDefinition = FurnitureDefinition::new(
     FurnitureObject::LASER_BORE,
@@ -584,6 +957,8 @@ pub const LASER_BORE_DEFINITION: FurnitureDefinition = FurnitureDefinition::new(
         .with_drill_depth_status(),
     1,
 )
+.with_chunk_activity()
+.with_noise_emission(8)
 .with_power(PowerRole::Consumer, [2, 0])
 .with_power_rate(LASER_BORE_DEMAND_MILLI_PER_SECOND);
 
@@ -596,8 +971,48 @@ pub const TURRET_DEFINITION: FurnitureDefinition = FurnitureDefinition::new(
         .with_kill_count_status(),
     2,
 )
+.with_chunk_activity()
+.with_facing()
 .with_power(PowerRole::Consumer, [1, 0])
 .with_power_rate(TURRET_DEMAND_MILLI_PER_SECOND);
+
+pub const AMMO_TURRET_DEFINITION: FurnitureDefinition = FurnitureDefinition::new(
+    FurnitureObject::AMMO_TURRET,
+    "AUTOCANNON TURRET",
+    [2, 2],
+    FurnitureSupport::Floor,
+    FurnitureInteraction::machine_with_transport(AMMO_TURRET_SLOTS, ItemTransportRole::Input)
+        .with_configuration(FurnitureConfiguration::TargetPriority)
+        .with_kill_count_status(),
+    0,
+)
+.with_chunk_activity()
+.with_facing()
+.with_power(PowerRole::Consumer, [1, 0])
+.with_power_rate(AMMO_TURRET_DEMAND_MILLI_PER_SECOND);
+
+pub const DIRECTIONAL_SENTRY_DEFINITION: FurnitureDefinition = FurnitureDefinition::new(
+    FurnitureObject::DIRECTIONAL_SENTRY,
+    "DIRECTIONAL SENTRY",
+    [1, 1],
+    FurnitureSupport::Side,
+    FurnitureInteraction::activatable_machine().with_kill_count_status(),
+    0,
+)
+.with_chunk_activity()
+.with_facing()
+.with_structural_collision()
+.with_power(PowerRole::Consumer, [0, 0])
+.with_power_rate(DIRECTIONAL_SENTRY_DEMAND_MILLI_PER_SECOND);
+
+pub const SPIKES_DEFINITION: FurnitureDefinition = FurnitureDefinition::new(
+    FurnitureObject::SPIKES,
+    "SPIKES",
+    [1, 1],
+    FurnitureSupport::Floor,
+    FurnitureInteraction::NONE,
+    0,
+);
 
 pub const ORBITAL_EXPORT_LAUNCHER_DEFINITION: FurnitureDefinition = FurnitureDefinition::new(
     FurnitureObject::ORBITAL_EXPORT_LAUNCHER,
@@ -610,6 +1025,7 @@ pub const ORBITAL_EXPORT_LAUNCHER_DEFINITION: FurnitureDefinition = FurnitureDef
     ),
     3,
 )
+.with_chunk_activity()
 .with_power(PowerRole::Consumer, [2, 0])
 .with_power_rate(ORBITAL_EXPORT_DEMAND_MILLI_PER_SECOND);
 
@@ -621,7 +1037,8 @@ pub const CARGO_CONVEYOR_DEFINITION: FurnitureDefinition = FurnitureDefinition::
     FurnitureInteraction::NONE,
     4,
 )
-.with_item_transport_connector();
+.with_item_transport_connector()
+.with_local_chunk_activity();
 
 pub const SOLAR_ARRAY_DEFINITION: FurnitureDefinition = FurnitureDefinition::new(
     FurnitureObject::SOLAR_ARRAY,
@@ -631,6 +1048,7 @@ pub const SOLAR_ARRAY_DEFINITION: FurnitureDefinition = FurnitureDefinition::new
     FurnitureInteraction::NONE,
     10,
 )
+.with_chunk_activity()
 .with_power(PowerRole::Generator, [1, 1])
 .with_power_rate(SOLAR_GENERATION_MILLI_PER_SECOND);
 
@@ -642,6 +1060,7 @@ pub const PYLON_DEFINITION: FurnitureDefinition = FurnitureDefinition::new(
     FurnitureInteraction::NONE,
     11,
 )
+.with_local_chunk_activity()
 .with_relay_power([0, 0], POWER_CONNECTION_RANGE_HALF_TILES, 10);
 
 pub const BATTERY_DEFINITION: FurnitureDefinition = FurnitureDefinition::new(
@@ -652,6 +1071,7 @@ pub const BATTERY_DEFINITION: FurnitureDefinition = FurnitureDefinition::new(
     FurnitureInteraction::power_storage(),
     12,
 )
+.with_chunk_activity()
 .with_power(PowerRole::Storage, [1, 0])
 .with_power_capacity(BATTERY_CAPACITY_MILLI);
 
@@ -663,7 +1083,7 @@ pub const POWERED_CABLE_ANCHOR_DEFINITION: FurnitureDefinition = FurnitureDefini
     FurnitureInteraction::NONE,
     13,
 )
-.with_relay_power([0, 0], POWER_CONNECTION_RANGE_HALF_TILES, 2);
+.with_local_chunk_activity();
 
 pub const POWER_CONNECTOR_DEFINITION: FurnitureDefinition = FurnitureDefinition::new(
     FurnitureObject::POWER_CONNECTOR,
@@ -673,6 +1093,7 @@ pub const POWER_CONNECTOR_DEFINITION: FurnitureDefinition = FurnitureDefinition:
     FurnitureInteraction::NONE,
     11,
 )
+.with_local_chunk_activity()
 .with_relay_power([0, 0], POWER_CONNECTOR_RANGE_TILES * 2, 5);
 
 pub const CARGO_LIFT_DEFINITION: FurnitureDefinition = FurnitureDefinition::new(
@@ -683,6 +1104,7 @@ pub const CARGO_LIFT_DEFINITION: FurnitureDefinition = FurnitureDefinition::new(
     FurnitureInteraction::local_container(CARGO_LIFT_SLOTS).with_lift_controls(),
     14,
 )
+.with_chunk_activity()
 .with_power(PowerRole::Consumer, [0, 0])
 .with_power_rate(CARGO_LIFT_DEMAND_MILLI_PER_SECOND);
 
@@ -693,7 +1115,95 @@ pub const LIFT_STATION_DEFINITION: FurnitureDefinition = FurnitureDefinition::ne
     FurnitureSupport::Floor,
     FurnitureInteraction::container(LIFT_STATION_SLOTS).with_lift_station_controls(),
     15,
+)
+.with_chunk_activity();
+
+pub const COMPOSITE_ASSEMBLER_DEFINITION: FurnitureDefinition = FurnitureDefinition::new(
+    FurnitureObject::COMPOSITE_ASSEMBLER,
+    "RESOURCE PROCESSOR",
+    [3, 2],
+    FurnitureSupport::Floor,
+    FurnitureInteraction::machine_with_transport(
+        COMPOSITE_ASSEMBLER_SLOTS,
+        ItemTransportRole::Processor,
+    ),
+    0,
+)
+.with_chunk_activity()
+.with_power(PowerRole::Consumer, [2, 0])
+.with_power_rate(COMPOSITE_ASSEMBLER_DEMAND_MILLI_PER_SECOND);
+
+pub const RED_SHAFT_BORE_DEFINITION: FurnitureDefinition = FurnitureDefinition::new(
+    FurnitureObject::RED_SHAFT_BORE,
+    "RED SHAFT BORE",
+    [6, 3],
+    FurnitureSupport::FloorEdges,
+    FurnitureInteraction::machine_with_transport(RED_SHAFT_BORE_SLOTS, ItemTransportRole::Output)
+        .with_drill_depth_status(),
+    0,
+)
+.with_chunk_activity()
+.with_noise_emission(24)
+.with_power(PowerRole::Consumer, [5, 0])
+.with_power_rate(RED_SHAFT_BORE_DEMAND_MILLI_PER_SECOND);
+
+pub const PROCUREMENT_TERMINAL_DEFINITION: FurnitureDefinition = FurnitureDefinition::new(
+    FurnitureObject::PROCUREMENT_TERMINAL,
+    "PROCUREMENT TERMINAL",
+    [2, 2],
+    FurnitureSupport::Floor,
+    FurnitureInteraction::procurement_terminal(),
+    0,
+)
+.with_local_chunk_activity()
+.with_power(PowerRole::Consumer, [1, 0])
+.with_power_rate(PROCUREMENT_TERMINAL_DEMAND_MILLI_PER_SECOND);
+
+pub const LASER_DRILL_DEFINITION: FurnitureDefinition = FurnitureDefinition::new(
+    FurnitureObject::LASER_DRILL,
+    "LASER DRILL",
+    [3, 2],
+    FurnitureSupport::FloorEdges,
+    FurnitureInteraction::machine_with_transport(LASER_DRILL_SLOTS, ItemTransportRole::Output)
+        .with_configuration(FurnitureConfiguration::LaserAim)
+        .with_drill_depth_status(),
+    0,
+)
+.with_chunk_activity()
+.with_noise_emission(12)
+.with_power(PowerRole::Consumer, [2, 0])
+.with_power_rate(LASER_DRILL_DEMAND_MILLI_PER_SECOND);
+
+pub const DOOR_DEFINITION: FurnitureDefinition = FurnitureDefinition::new(
+    FurnitureObject::DOOR,
+    "SETTLEMENT DOOR",
+    [1, 3],
+    FurnitureSupport::Floor,
+    FurnitureInteraction::door(),
+    0,
+)
+.with_room_boundary();
+
+pub const BED_DEFINITION: FurnitureDefinition = FurnitureDefinition::new(
+    FurnitureObject::BED,
+    "SETTLEMENT BED",
+    [2, 1],
+    FurnitureSupport::Floor,
+    FurnitureInteraction::bed(),
+    0,
 );
+
+pub const SUBSURFACE_SURVEYOR_DEFINITION: FurnitureDefinition = FurnitureDefinition::new(
+    FurnitureObject::SUBSURFACE_SURVEYOR,
+    "SUBSURFACE SURVEYOR",
+    [3, 2],
+    FurnitureSupport::Floor,
+    FurnitureInteraction::activatable_machine().with_subsurface_survey_status(),
+    0,
+)
+.with_chunk_activity()
+.with_power(PowerRole::Consumer, [2, 0])
+.with_power_rate(SUBSURFACE_SURVEYOR_DEMAND_MILLI_PER_SECOND);
 
 /// The single registration table for built-in furniture metadata. Placement,
 /// persistence, interaction UI, and rendering all resolve definitions here.
@@ -710,99 +1220,26 @@ pub const BUILT_IN_FURNITURE: &[FurnitureDefinition] = &[
     CARGO_LIFT_DEFINITION,
     LIFT_STATION_DEFINITION,
     POWER_CONNECTOR_DEFINITION,
+    COMPOSITE_ASSEMBLER_DEFINITION,
+    RED_SHAFT_BORE_DEFINITION,
+    PROCUREMENT_TERMINAL_DEFINITION,
+    LASER_DRILL_DEFINITION,
+    AMMO_TURRET_DEFINITION,
+    DIRECTIONAL_SENTRY_DEFINITION,
+    SPIKES_DEFINITION,
+    DOOR_DEFINITION,
+    BED_DEFINITION,
+    SUBSURFACE_SURVEYOR_DEFINITION,
 ];
 
 pub fn furniture_definition(object_type: ObjectTypeId) -> Option<FurnitureDefinition> {
+    const FIRST_FURNITURE_ID: u16 = 256;
+    let index = object_type.raw().checked_sub(FIRST_FURNITURE_ID)? as usize;
     BUILT_IN_FURNITURE
-        .iter()
+        .get(index)
         .copied()
-        .find(|definition| definition.object_type == object_type)
+        .filter(|definition| definition.object_type == object_type)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn built_in_furniture_ids_are_unique() {
-        for (index, definition) in BUILT_IN_FURNITURE.iter().enumerate() {
-            assert!(
-                BUILT_IN_FURNITURE[index + 1..]
-                    .iter()
-                    .all(|other| other.object_type != definition.object_type)
-            );
-        }
-    }
-
-    #[test]
-    fn cargo_roles_and_connector_are_definition_owned() {
-        assert_eq!(
-            CHEST_DEFINITION.interaction().item_transport_role(),
-            Some(ItemTransportRole::Buffer)
-        );
-        assert_eq!(
-            LASER_BORE_DEFINITION.interaction().item_transport_role(),
-            Some(ItemTransportRole::Output)
-        );
-        assert_eq!(
-            ORBITAL_EXPORT_LAUNCHER_DEFINITION
-                .interaction()
-                .item_transport_role(),
-            Some(ItemTransportRole::Input)
-        );
-        assert!(CARGO_CONVEYOR_DEFINITION.is_item_transport_connector());
-        assert_eq!(CARGO_CONVEYOR_DEFINITION.size(), [1, 1]);
-        assert_eq!(
-            LIFT_STATION_DEFINITION.interaction().item_transport_role(),
-            Some(ItemTransportRole::Buffer)
-        );
-        assert!(
-            LIFT_STATION_DEFINITION
-                .interaction()
-                .shows_lift_station_controls()
-        );
-        assert_eq!(
-            CARGO_LIFT_DEFINITION.power_role(),
-            Some(PowerRole::Consumer)
-        );
-    }
-
-    #[test]
-    fn power_roles_and_sockets_are_definition_owned() {
-        assert_eq!(
-            SOLAR_ARRAY_DEFINITION.power_role(),
-            Some(PowerRole::Generator)
-        );
-        assert_eq!(PYLON_DEFINITION.power_role(), Some(PowerRole::Relay));
-        assert_eq!(
-            POWER_CONNECTOR_DEFINITION.power_role(),
-            Some(PowerRole::Relay)
-        );
-        assert_eq!(POWER_CONNECTOR_DEFINITION.size(), [1, 1]);
-        assert_eq!(POWER_CONNECTOR_DEFINITION.support(), FurnitureSupport::Side);
-        assert_eq!(POWER_CONNECTOR_DEFINITION.power_connection_limit(), 5);
-        assert_eq!(
-            POWER_CONNECTOR_DEFINITION.power_connection_range_half_tiles(),
-            16
-        );
-        assert_eq!(BATTERY_DEFINITION.power_role(), Some(PowerRole::Storage));
-        assert_eq!(
-            LASER_BORE_DEFINITION.power_role(),
-            Some(PowerRole::Consumer)
-        );
-        assert_eq!(TURRET_DEFINITION.power_role(), Some(PowerRole::Consumer));
-        assert_eq!(TURRET_DEFINITION.power_socket_half_tiles(), Some([1, 0]));
-        assert_eq!(
-            ORBITAL_EXPORT_LAUNCHER_DEFINITION.power_role(),
-            Some(PowerRole::Consumer)
-        );
-        assert_eq!(PYLON_DEFINITION.power_socket_half_tiles(), Some([0, 0]));
-        assert_eq!(BATTERY_DEFINITION.power_socket_half_tiles(), Some([1, 0]));
-        assert_eq!(
-            BATTERY_DEFINITION.power_capacity_milli(),
-            BATTERY_CAPACITY_MILLI
-        );
-        assert!(BATTERY_DEFINITION.interaction().is_interactive());
-        assert!(BATTERY_DEFINITION.interaction().shows_power_storage());
-    }
-}
+mod tests;

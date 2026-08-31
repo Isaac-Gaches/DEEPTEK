@@ -1,7 +1,7 @@
 use super::{Collider, DynamicLight, Projectile, Sprite, Transform};
 use crate::{
-    Layer, ProjectileKind, TerrainRenderer, TileId, TilePos, World,
-    terrain_renderer::LaserParticleEmitter,
+    DroppedItemContext, Layer, ProjectileKind, TerrainRenderer, TilePos, World,
+    terrain_renderer::{LaserParticleEmitter, LaserParticleKind},
 };
 use easy_gpu::assets::Material;
 use easy_gpu::assets_manager::Handle;
@@ -22,6 +22,10 @@ const LASER_DUST_PARTICLES_PER_PULSE: usize = 10;
 const LASER_PARTICLE_COLOUR: [f32; 4] = [0.0, 1.0, 1.0, 1.0];
 const DUST_PARTICLE_COLOUR: [f32; 4] = [0.58, 0.46, 0.34, 0.8];
 const LASER_ENERGY_LIGHT: [f32; 3] = [0.0, 0.72, 0.9];
+const RED_LASER_PARTICLE_COLOUR: [f32; 4] = [1.0, 0.03, 0.01, 1.0];
+const RED_LASER_DUST_COLOUR: [f32; 4] = [0.78, 0.06, 0.02, 0.8];
+const RED_LASER_ENERGY_LIGHT: [f32; 3] = [1.0, 0.025, 0.01];
+const MAX_LASER_EMITTER_WIDTH: usize = 4;
 const EXPORT_SPARK_COUNT: usize = 18;
 const EXPORT_SPARK_COLOUR: [f32; 4] = [0.0, 1.0, 1.0, 1.0];
 const EXPORT_SPARK_LIGHT: [f32; 3] = [0.0, 0.58, 0.82];
@@ -52,6 +56,7 @@ pub enum ParticleKind {
     Spark,
     ExportSpark,
     LaserEnergy,
+    RedLaserEnergy,
     Smoke,
     Dust,
 }
@@ -130,6 +135,7 @@ impl EffectsSystem {
         terrain: &mut World,
         renderer: &mut TerrainRenderer,
         particle_material: Handle<Material>,
+        mut dropped_items: DroppedItemContext<'_>,
         elapsed: f32,
     ) {
         let elapsed = elapsed.max(0.0);
@@ -146,7 +152,14 @@ impl EffectsSystem {
         }
 
         while let Some(explosion) = self.explosions.pop() {
-            self.destroy_terrain(terrain, renderer, explosion.position, explosion.radius);
+            self.destroy_terrain(
+                entities,
+                terrain,
+                renderer,
+                &mut dropped_items,
+                explosion.position,
+                explosion.radius,
+            );
             self.spawn_explosion_particles(
                 entities,
                 particle_material,
@@ -197,11 +210,24 @@ impl EffectsSystem {
             pulses += 1;
             for &emitter in emitters.iter().take(MAX_LASER_EMITTERS) {
                 if let Some(impact) = emitter.impact {
-                    for _ in 0..LASER_IMPACT_PARTICLES_PER_PULSE {
-                        self.spawn_laser_energy_particle(entities, particle_material, impact);
+                    let density = (emitter.width.ceil() as usize).clamp(1, MAX_LASER_EMITTER_WIDTH);
+                    for _ in 0..LASER_IMPACT_PARTICLES_PER_PULSE * density {
+                        let position = self.random_laser_impact(impact, emitter.width);
+                        self.spawn_laser_energy_particle(
+                            entities,
+                            particle_material,
+                            position,
+                            emitter.kind,
+                        );
                     }
-                    for _ in 0..LASER_DUST_PARTICLES_PER_PULSE {
-                        self.spawn_laser_dust_particle(entities, particle_material, impact);
+                    for _ in 0..LASER_DUST_PARTICLES_PER_PULSE * density {
+                        let position = self.random_laser_impact(impact, emitter.width);
+                        self.spawn_laser_dust_particle(
+                            entities,
+                            particle_material,
+                            position,
+                            emitter.kind,
+                        );
                     }
                 }
             }
@@ -261,7 +287,7 @@ impl EffectsSystem {
             transform.scale = [scale; 2];
             sprite.tint[3] = match particle.kind {
                 ParticleKind::Spark | ParticleKind::ExportSpark => remaining,
-                ParticleKind::LaserEnergy => remaining.sqrt(),
+                ParticleKind::LaserEnergy | ParticleKind::RedLaserEnergy => remaining.sqrt(),
                 ParticleKind::Smoke => remaining.powi(3) * 0.7,
                 ParticleKind::Dust => remaining.powi(2) * 0.8,
             };
@@ -281,7 +307,9 @@ impl EffectsSystem {
                     transform.position[0] += particle.velocity[0] * elapsed;
                     transform.position[1] += particle.velocity[1] * elapsed;
                 }
-                ParticleKind::LaserEnergy | ParticleKind::ExportSpark => {
+                ParticleKind::LaserEnergy
+                | ParticleKind::RedLaserEnergy
+                | ParticleKind::ExportSpark => {
                     let damping = (-1.8 * elapsed).exp();
                     particle.velocity[0] *= damping;
                     particle.velocity[1] *= damping;
@@ -296,6 +324,7 @@ impl EffectsSystem {
                 ParticleKind::Spark => SPARK_LIGHT,
                 ParticleKind::ExportSpark => EXPORT_SPARK_LIGHT,
                 ParticleKind::LaserEnergy => LASER_ENERGY_LIGHT,
+                ParticleKind::RedLaserEnergy => RED_LASER_ENERGY_LIGHT,
                 ParticleKind::Smoke | ParticleKind::Dust => continue,
             };
             let intensity = particle.normalized_remaining();
@@ -308,18 +337,24 @@ impl EffectsSystem {
 
     fn destroy_terrain(
         &mut self,
+        entities: &mut EntityWorld,
         terrain: &mut World,
         renderer: &mut TerrainRenderer,
+        dropped_items: &mut DroppedItemContext<'_>,
         position: [f32; 2],
         radius: u32,
     ) {
         collect_explosion_tiles(terrain, position, radius, &mut self.affected_tiles);
         for tile in self.affected_tiles.drain(..) {
-            if terrain.tile(tile.x, tile.y, Layer::Foreground).ok() != Some(TileId::EMPTY) {
-                renderer
-                    .set_tile(terrain, tile.x, tile.y, Layer::Foreground, TileId::EMPTY)
-                    .expect("explosion positions are clipped to world bounds");
-            }
+            dropped_items.system.break_target(
+                entities,
+                dropped_items.material,
+                dropped_items.registry,
+                terrain,
+                renderer,
+                tile,
+                Layer::Foreground,
+            );
         }
     }
 
@@ -380,24 +415,37 @@ impl EffectsSystem {
         entities: &mut EntityWorld,
         material: Handle<Material>,
         position: [f32; 2],
+        emitter_kind: LaserParticleKind,
     ) {
         let horizontal = (self.random_unit() * 2.0 - 1.0) * 5.0;
         let vertical = -(2.5 + self.random_unit() * 5.5);
         let lifetime = 0.45 + self.random_unit() * 0.25;
         let start_scale = 0.9 + self.random_unit() * 0.3;
+        let (particle_kind, colour, light) = match emitter_kind {
+            LaserParticleKind::Cyan => (
+                ParticleKind::LaserEnergy,
+                LASER_PARTICLE_COLOUR,
+                LASER_ENERGY_LIGHT,
+            ),
+            LaserParticleKind::Red => (
+                ParticleKind::RedLaserEnergy,
+                RED_LASER_PARTICLE_COLOUR,
+                RED_LASER_ENERGY_LIGHT,
+            ),
+        };
         entities.spawn((
             Particle::new(
-                ParticleKind::LaserEnergy,
+                particle_kind,
                 lifetime,
                 [horizontal, vertical],
                 start_scale,
                 0.2,
             ),
-            DynamicLight::new(LASER_ENERGY_LIGHT),
+            DynamicLight::new(light),
             Transform::new(position).with_scale([start_scale; 2]),
             Sprite::new(material)
                 .with_frame(0)
-                .with_tint(LASER_PARTICLE_COLOUR)
+                .with_tint(colour)
                 .with_emissive(1.0)
                 .with_depth(0.08),
         ));
@@ -408,6 +456,7 @@ impl EffectsSystem {
         entities: &mut EntityWorld,
         material: Handle<Material>,
         position: [f32; 2],
+        emitter_kind: LaserParticleKind,
     ) {
         let velocity = [
             (self.random_unit() * 2.0 - 1.0) * 5.5,
@@ -415,15 +464,26 @@ impl EffectsSystem {
         ];
         let lifetime = 0.55 + self.random_unit() * 0.35;
         let start_scale = 0.3 + self.random_unit() * 0.18;
+        let colour = match emitter_kind {
+            LaserParticleKind::Cyan => DUST_PARTICLE_COLOUR,
+            LaserParticleKind::Red => RED_LASER_DUST_COLOUR,
+        };
         entities.spawn((
             Particle::new(ParticleKind::Dust, lifetime, velocity, start_scale, 0.65),
             Transform::new(position).with_scale([start_scale; 2]),
             Sprite::new(material)
                 .with_frame(1)
-                .with_tint(DUST_PARTICLE_COLOUR)
+                .with_tint(colour)
                 .with_emissive(0.05)
                 .with_depth(0.09),
         ));
+    }
+
+    fn random_laser_impact(&mut self, centre: [f32; 2], width: f32) -> [f32; 2] {
+        [
+            centre[0] + (self.random_unit() - 0.5) * width.max(0.0),
+            centre[1],
+        ]
     }
 
     fn random_unit(&mut self) -> f32 {
@@ -532,6 +592,8 @@ mod tests {
             &mut entities,
             &[LaserParticleEmitter {
                 impact: Some([4.0, 12.5]),
+                width: 1.0,
+                kind: LaserParticleKind::Cyan,
             }],
             test_material(),
             LASER_PARTICLE_INTERVAL,
@@ -550,6 +612,9 @@ mod tests {
                     energy_particles += 1;
                     assert_eq!(sprite.tint, LASER_PARTICLE_COLOUR);
                     assert_eq!(sprite.frame, 0);
+                }
+                ParticleKind::RedLaserEnergy => {
+                    panic!("cyan laser bore should not emit red energy")
                 }
                 ParticleKind::Dust => {
                     dust += 1;
@@ -572,6 +637,8 @@ mod tests {
         let emitters = vec![
             LaserParticleEmitter {
                 impact: Some([1.0, 1.0]),
+                width: 1.0,
+                kind: LaserParticleKind::Cyan,
             };
             MAX_LASER_EMITTERS + 8
         ];
@@ -584,6 +651,51 @@ mod tests {
                 * MAX_LASER_PULSES_PER_FRAME
                 * (LASER_IMPACT_PARTICLES_PER_PULSE + LASER_DUST_PARTICLES_PER_PULSE)
         );
+    }
+
+    #[test]
+    fn wide_red_laser_emitter_spawns_red_particles_and_lights_across_its_width() {
+        let mut entities = EntityWorld::new();
+        let mut system = EffectsSystem::default();
+        system.emit_laser_particles_from(
+            &mut entities,
+            &[LaserParticleEmitter {
+                impact: Some([12.5, 11.5]),
+                width: 4.0,
+                kind: LaserParticleKind::Red,
+            }],
+            test_material(),
+            LASER_PARTICLE_INTERVAL,
+        );
+
+        assert_eq!(
+            entities.len() as usize,
+            MAX_LASER_EMITTER_WIDTH
+                * (LASER_IMPACT_PARTICLES_PER_PULSE + LASER_DUST_PARTICLES_PER_PULSE)
+        );
+        let mut energy = 0;
+        let mut dust = 0;
+        for (_, (particle, transform, sprite)) in
+            entities.query::<(&Particle, &Transform, &Sprite)>().iter()
+        {
+            assert!((10.5..=14.5).contains(&transform.position[0]));
+            match particle.kind {
+                ParticleKind::RedLaserEnergy => {
+                    energy += 1;
+                    assert_eq!(sprite.tint, RED_LASER_PARTICLE_COLOUR);
+                }
+                ParticleKind::Dust => {
+                    dust += 1;
+                    assert_eq!(sprite.tint, RED_LASER_DUST_COLOUR);
+                }
+                _ => panic!("red shaft bore emitted a particle with the wrong palette"),
+            }
+        }
+        for (_, light) in entities.query::<&DynamicLight>().iter() {
+            assert_eq!(light.colour, RED_LASER_ENERGY_LIGHT);
+        }
+        assert_eq!(energy, LASER_IMPACT_PARTICLES_PER_PULSE * 4);
+        assert_eq!(dust, LASER_DUST_PARTICLES_PER_PULSE * 4);
     }
 
     #[test]

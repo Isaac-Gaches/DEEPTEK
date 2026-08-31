@@ -1,10 +1,15 @@
+mod biomes;
 mod blocks;
 mod decorations;
+mod durability;
 mod furniture;
 mod generator;
 mod nature;
 mod objects;
 mod persistence;
+mod player_state;
+mod structures;
+mod survey;
 mod world_objects;
 
 use std::collections::VecDeque;
@@ -13,31 +18,49 @@ use std::fmt;
 use std::io;
 use std::path::Path;
 
-pub use blocks::{BUILT_IN_BLOCKS, BlockDefinition, block_definition};
+pub use biomes::{BiomeId, BiomeMap};
+pub use blocks::{BUILT_IN_BLOCKS, BlockDefinition, background_tile_for, block_definition};
 pub use decorations::{
     BUILT_IN_DECORATIONS, DecorationDefinition, DecorationVisual, NaturalObject,
     POWERED_CABLE_OBJECT, ROPE_OBJECT, decoration_definition,
 };
-pub(crate) use furniture::LaserBoreBeam;
+pub use durability::{BlockDamage, BlockHealth, DEFAULT_BLOCK_HEALTH};
 pub use furniture::{
-    BATTERY_CAPACITY_MILLI, BATTERY_DEFINITION, BUILT_IN_FURNITURE, CARGO_CONVEYOR_DEFINITION,
-    CARGO_LIFT_DEFINITION, CARGO_LIFT_DEMAND_MILLI_PER_SECOND, CARGO_LIFT_SLOTS,
-    CARGO_LIFT_SPEED_MILLI_TILES_PER_SECOND, CHEST_DEFINITION, CargoLiftDirection,
-    FurnitureConfiguration, FurnitureDefinition, FurnitureInteraction, FurnitureObject,
-    FurnitureSupport, ItemTransportRole, LASER_BORE_DEFINITION, LASER_BORE_DEMAND_MILLI_PER_SECOND,
-    LASER_BORE_MAX_LENGTH, LASER_BORE_SLOTS, LASER_BORE_TICKS_PER_TILE, LIFT_STATION_DEFINITION,
-    LIFT_STATION_SLOTS, LiftStationConfiguration, LiftStationMode,
+    AMMO_TURRET_DEFINITION, AMMO_TURRET_DEMAND_MILLI_PER_SECOND, AMMO_TURRET_SLOTS,
+    BATTERY_CAPACITY_MILLI, BATTERY_DEFINITION, BED_DEFINITION, BUILT_IN_FURNITURE,
+    CARGO_CONVEYOR_DEFINITION, CARGO_LIFT_DEFINITION, CARGO_LIFT_DEMAND_MILLI_PER_SECOND,
+    CARGO_LIFT_SLOTS, CARGO_LIFT_SPEED_MILLI_TILES_PER_SECOND, CHEST_DEFINITION,
+    COMPOSITE_ASSEMBLER_DEFINITION, COMPOSITE_ASSEMBLER_DEMAND_MILLI_PER_SECOND,
+    COMPOSITE_ASSEMBLER_SLOTS, CargoLiftDirection, ChunkActivity, DEFAULT_MACHINE_HEALTH,
+    DIRECTIONAL_SENTRY_DEFINITION, DIRECTIONAL_SENTRY_DEMAND_MILLI_PER_SECOND, DOOR_DEFINITION,
+    FurnitureConfiguration, FurnitureDefinition, FurnitureFacing, FurnitureInteraction,
+    FurnitureObject, FurnitureSupport, ItemTransportRole, LASER_BORE_DEFINITION,
+    LASER_BORE_DEMAND_MILLI_PER_SECOND, LASER_BORE_MAX_LENGTH, LASER_BORE_SLOTS,
+    LASER_BORE_TICKS_PER_TILE, LASER_DRILL_DEFINITION, LASER_DRILL_DEMAND_MILLI_PER_SECOND,
+    LASER_DRILL_MAX_LENGTH, LASER_DRILL_SLOTS, LIFT_STATION_DEFINITION, LIFT_STATION_SLOTS,
+    LaserDrillAim, LiftStationConfiguration, LiftStationMode,
     ORBITAL_EXPORT_DEMAND_MILLI_PER_SECOND, ORBITAL_EXPORT_LAUNCHER_DEFINITION,
     ORBITAL_EXPORT_LAUNCHER_SLOTS, POWER_CONNECTION_RANGE_HALF_TILES, POWER_CONNECTION_RANGE_TILES,
     POWER_CONNECTOR_DEFINITION, POWER_CONNECTOR_RANGE_TILES, POWERED_CABLE_ANCHOR_DEFINITION,
-    PYLON_DEFINITION, PowerRole, SOLAR_ARRAY_DEFINITION, SOLAR_GENERATION_MILLI_PER_SECOND,
-    TURRET_DEFINITION, TURRET_DEMAND_MILLI_PER_SECOND, TargetPriority, furniture_definition,
+    PROCUREMENT_TERMINAL_DEFINITION, PROCUREMENT_TERMINAL_DEMAND_MILLI_PER_SECOND,
+    PYLON_DEFINITION, PowerRole, RED_SHAFT_BORE_DEFINITION, RED_SHAFT_BORE_DEMAND_MILLI_PER_SECOND,
+    RED_SHAFT_BORE_SLOTS, RED_SHAFT_BORE_WIDTH, SOLAR_ARRAY_DEFINITION,
+    SOLAR_GENERATION_MILLI_PER_SECOND, SPIKES_DEFINITION, SUBSURFACE_SURVEY_DEPTH,
+    SUBSURFACE_SURVEY_WIDTH, SUBSURFACE_SURVEYOR_DEFINITION,
+    SUBSURFACE_SURVEYOR_DEMAND_MILLI_PER_SECOND, TURRET_DEFINITION, TURRET_DEMAND_MILLI_PER_SECOND,
+    TargetPriority, furniture_definition,
+};
+pub(crate) use furniture::{
+    LaserBoreBeam, LaserDrillBeam, RedShaftBoreBeam, configuration_variant,
 };
 pub use generator::WorldGenerator;
 pub use nature::{MAX_VINE_LENGTH, NatureSimulationConfig, NatureUpdate};
 pub use objects::{
-    DecorationUpdate, ObjectId, ObjectPlacementError, ObjectTypeId, TilePos, WorldObject,
+    DecorationUpdate, MachineDamage, MachineHealth, ObjectId, ObjectPlacementError, ObjectTypeId,
+    RemovedObject, TilePos, WorldObject,
 };
+pub use player_state::PlayerState;
+pub use survey::{MAX_SURVEY_ORE_TYPES, OreEstimate, SubsurfaceSurvey};
 
 pub const CHUNK_SIZE: usize = 64;
 const CHUNK_AREA: usize = CHUNK_SIZE * CHUNK_SIZE;
@@ -45,8 +68,12 @@ pub const MAX_WORLD_WIDTH: u32 = 10_000;
 pub const MAX_WORLD_HEIGHT: u32 = 16_000;
 pub const MAX_WORLD_TILES: u64 = 64_000_000;
 pub const MAX_WORLD_NAME_BYTES: usize = 64;
-pub const SEA_LEVEL_PERCENT: u32 = 34;
+/// Surface datum. At the maximum 16,000-tile height this leaves roughly
+/// 14,000 tiles of underground terrain beneath the player.
+pub const SEA_LEVEL_PERCENT: u32 = 12;
 pub const METRES_PER_TILE: f32 = 0.7;
+/// Solar arrays and orbital exporters shut down at or below this elevation.
+pub const SKY_MACHINE_MIN_ELEVATION_DECIMETRES: i32 = -1_000;
 /// Late morning, expressed as a normalized fraction of the day cycle.
 pub const DEFAULT_TIME_OF_DAY: f32 = 0.42;
 const FOREGROUND_CHANGE_HISTORY: usize = 4_096;
@@ -59,6 +86,19 @@ struct ForegroundChangeLog {
     revision: u64,
     positions: VecDeque<TilePos>,
 }
+
+/// Runtime-only invalidation counter for room geometry. It intentionally does
+/// not participate in save equality because cached room data is reconstructed.
+#[derive(Clone, Copy, Debug, Default)]
+struct HousingChangeRevision(u64);
+
+impl PartialEq for HousingChangeRevision {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for HousingChangeRevision {}
 
 impl PartialEq for ForegroundChangeLog {
     fn eq(&self, _other: &Self) -> bool {
@@ -115,6 +155,8 @@ impl ForegroundTile {
     pub const GRASS: TileId = TileId::new(1);
     pub const DIRT: TileId = TileId::new(2);
     pub const STONE: TileId = TileId::new(3);
+    pub const IRON_ORE: TileId = TileId::new(5);
+    pub const ASTERITE: TileId = TileId::new(7);
 }
 
 pub struct BackgroundTile;
@@ -125,10 +167,18 @@ impl BackgroundTile {
     pub const STONE_WALL: TileId = TileId::new(2);
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Layer {
     Foreground,
     Background,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrokenTile {
+    pub position: TilePos,
+    pub layer: Layer,
+    pub tile: TileId,
+    pub unsupported_objects: Vec<RemovedObject>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -185,12 +235,17 @@ pub struct World {
     chunks_wide: u32,
     chunks_high: u32,
     chunks: Vec<Chunk>,
+    biomes: BiomeMap,
     objects: objects::ObjectStore,
     simulation_tick: u64,
     simulation_remainder_nanos: u64,
     player_position_bits: Option<[u32; 2]>,
+    player_state: Option<PlayerState>,
     time_of_day_bits: u32,
     foreground_changes: ForegroundChangeLog,
+    housing_changes: HousingChangeRevision,
+    block_damage: durability::BlockDamageStore,
+    pub(crate) specialists: Vec<crate::SpecialistRecord>,
 }
 
 impl World {
@@ -210,12 +265,17 @@ impl World {
             chunks_wide,
             chunks_high,
             chunks,
+            biomes: BiomeMap::normal(chunks_wide, chunks_high),
             objects: objects::ObjectStore::new(count, chunks_wide),
             simulation_tick: 0,
             simulation_remainder_nanos: 0,
             player_position_bits: None,
+            player_state: None,
             time_of_day_bits: DEFAULT_TIME_OF_DAY.to_bits(),
             foreground_changes: ForegroundChangeLog::default(),
+            housing_changes: HousingChangeRevision::default(),
+            block_damage: durability::BlockDamageStore::default(),
+            specialists: Vec::new(),
         })
     }
 
@@ -280,6 +340,14 @@ impl World {
         }
         self.player_position_bits = position.map(|position| position.map(f32::to_bits));
         Ok(())
+    }
+
+    pub const fn player_state(&self) -> Option<&PlayerState> {
+        self.player_state.as_ref()
+    }
+
+    pub fn set_player_state(&mut self, state: Option<PlayerState>) {
+        self.player_state = state;
     }
 
     pub fn time_of_day(&self) -> f32 {
@@ -368,15 +436,7 @@ impl World {
                 self.objects.remove_rooted_at(position);
             } else if previous == TileId::EMPTY {
                 if let Some(object) = self.objects.occupying(position) {
-                    let object_type = self
-                        .objects
-                        .object(object)
-                        .map(WorldObject::object_type)
-                        .expect("occupancy references a live object");
-                    if matches!(
-                        object_type,
-                        POWERED_CABLE_OBJECT | FurnitureObject::CARGO_LIFT
-                    ) {
+                    if self.blocks_foreground_tile_placement(position) {
                         return Err(WorldError::OccupiedByObject { object });
                     }
                     let survives_placement = self.objects.object(object).is_some_and(|object| {
@@ -398,15 +458,59 @@ impl World {
         {
             self.objects.remove_rooted_at(TilePos::new(x, y));
         }
+        self.clear_block_damage(TilePos::new(x, y), layer);
         self.chunks[chunk_index].set_tile(local_x, local_y, layer, tile);
+        self.housing_changes.0 = self.housing_changes.0.wrapping_add(1);
         if layer == Layer::Foreground {
             self.foreground_changes.record(TilePos::new(x, y));
         }
         Ok(())
     }
 
-    pub(crate) const fn foreground_revision(&self) -> u64 {
+    /// Removes one non-empty tile and returns everything detached by that
+    /// destruction. Unlike the general editing API, this deliberately permits
+    /// container furniture to be knocked off its support because the caller is
+    /// given ownership of every stored stack in `unsupported_objects`.
+    pub fn break_tile(
+        &mut self,
+        position: TilePos,
+        layer: Layer,
+    ) -> Result<Option<BrokenTile>, WorldError> {
+        let (chunk_index, local_x, local_y) = self.locate(position.x, position.y)?;
+        let tile = self.chunks[chunk_index].tile(local_x, local_y, layer);
+        if tile == TileId::EMPTY {
+            self.clear_block_damage(position, layer);
+            return Ok(None);
+        }
+        let unsupported_objects = if layer == Layer::Foreground
+            || self.tile_in_bounds(position.x, position.y, Layer::Foreground) == TileId::EMPTY
+        {
+            self.objects.remove_rooted_at(position)
+        } else {
+            Vec::new()
+        };
+        self.chunks[chunk_index].set_tile(local_x, local_y, layer, TileId::EMPTY);
+        self.clear_block_damage(position, layer);
+        self.housing_changes.0 = self.housing_changes.0.wrapping_add(1);
+        if layer == Layer::Foreground {
+            self.foreground_changes.record(position);
+        }
+        Ok(Some(BrokenTile {
+            position,
+            layer,
+            tile,
+            unsupported_objects,
+        }))
+    }
+
+    /// Monotonically changes whenever a foreground cell is edited. Runtime
+    /// read-only systems can use it to invalidate bounded derived caches.
+    pub const fn foreground_revision(&self) -> u64 {
         self.foreground_changes.revision
+    }
+
+    pub(crate) const fn housing_revision(&self) -> [u64; 2] {
+        [self.housing_changes.0, self.objects.spatial_revision()]
     }
 
     pub(crate) fn foreground_changes_since(
@@ -586,10 +690,10 @@ mod tests {
     #[test]
     fn elevation_is_positive_above_sea_level_and_negative_below() {
         let world = World::empty(10, 100, 0).unwrap();
-        assert_eq!(world.sea_level_y(), 34);
-        assert_eq!(world.elevation_decimetres(24.0), 70);
-        assert_eq!(world.elevation_decimetres(34.0), 0);
-        assert_eq!(world.elevation_decimetres(44.0), -70);
+        assert_eq!(world.sea_level_y(), 12);
+        assert_eq!(world.elevation_decimetres(2.0), 70);
+        assert_eq!(world.elevation_decimetres(12.0), 0);
+        assert_eq!(world.elevation_decimetres(22.0), -70);
     }
 
     #[test]

@@ -79,12 +79,34 @@ fn is_emissive_key(colour: vec3<f32>) -> bool {
 
 @fragment
 fn fs_foreground(input: VertexOutput) -> @location(0) vec4<f32> {
-    let colour = textureSample(terrain_texture, terrain_sampler, input.uv);
+    var colour = textureSample(terrain_texture, terrain_sampler, input.uv);
     if colour.a < 0.5 {
         discard;
     }
     if is_emissive_key(colour.rgb) {
         return colour;
+    }
+    // Stable tile ID 5 occupies column 0 / row 1 in the 4x3 atlas. Reusing
+    // that legacy marching-square frame keeps the atlas layout compatible;
+    // this metallic grade makes the new iron formations distinct in-world.
+    if input.uv.x < 0.25 && input.uv.y >= 1.0 / 3.0 && input.uv.y < 2.0 / 3.0 {
+        let luminance = dot(colour.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+        let metal = mix(
+            vec3<f32>(0.10, 0.105, 0.11),
+            vec3<f32>(0.62, 0.30, 0.105),
+            smoothstep(0.12, 0.72, luminance),
+        );
+        colour = vec4<f32>(metal, colour.a);
+    }
+    // Stable tile ID 7 uses column 2 / row 1 and is graded as luminous blue
+    // Asterite while retaining the legacy marching-square silhouettes.
+    if input.uv.x >= 0.5 && input.uv.x < 0.75 &&
+        input.uv.y >= 1.0 / 3.0 && input.uv.y < 2.0 / 3.0 {
+        let luminance = dot(colour.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+        colour = vec4<f32>(
+            mix(vec3<f32>(0.035, 0.09, 0.16), vec3<f32>(0.12, 0.72, 1.0), luminance),
+            colour.a,
+        );
     }
     let light = textureSample(light_texture, light_sampler, input.light_uv);
     return colour * light;

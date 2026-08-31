@@ -1,4 +1,4 @@
-use crate::{Layer, ObjectTypeId, TileId};
+use crate::{BackgroundTile, Layer, ObjectTypeId, TileId};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(transparent)]
@@ -26,6 +26,21 @@ impl ItemId {
     pub const CARGO_LIFT: Self = Self(19);
     pub const LIFT_STATION: Self = Self(20);
     pub const POWER_CONNECTOR: Self = Self(21);
+    pub const HARDENED_COMPOSITE: Self = Self(22);
+    pub const COMPOSITE_ASSEMBLER: Self = Self(23);
+    pub const RED_SHAFT_BORE: Self = Self(24);
+    pub const PROCUREMENT_TERMINAL: Self = Self(25);
+    pub const LASER_DRILL: Self = Self(26);
+    pub const AMMO_TURRET: Self = Self(27);
+    pub const DIRECTIONAL_SENTRY: Self = Self(28);
+    pub const TURRET_AMMO: Self = Self(29);
+    pub const SPIKES: Self = Self(30);
+    pub const DOOR: Self = Self(31);
+    pub const BED: Self = Self(32);
+    pub const IRON_ORE: Self = Self(33);
+    pub const SUBSURFACE_SURVEYOR: Self = Self(34);
+    pub const IRON_INGOT: Self = Self(35);
+    pub const ASTERITE: Self = Self(36);
 
     pub const fn new(value: u16) -> Self {
         Self(value)
@@ -36,10 +51,17 @@ impl ItemId {
     }
 }
 
-pub(crate) fn mined_block_drop(tile: TileId) -> Option<(ItemId, u16)> {
+pub(crate) fn mined_block_drop(tile: TileId, layer: Layer) -> Option<(ItemId, u16)> {
     // Kept as a small function so mining systems do not depend on registry
     // storage details.
-    crate::block_definition(tile).and_then(crate::BlockDefinition::mined_drop)
+    match layer {
+        Layer::Foreground => {
+            crate::block_definition(tile).and_then(crate::BlockDefinition::mined_drop)
+        }
+        Layer::Background if tile == BackgroundTile::DIRT_WALL => Some((ItemId::DIRT_BLOCK, 999)),
+        Layer::Background if tile == BackgroundTile::STONE_WALL => Some((ItemId::STONE_BLOCK, 999)),
+        Layer::Background => None,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

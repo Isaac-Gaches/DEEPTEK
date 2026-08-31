@@ -1,5 +1,5 @@
 use super::{Collider, Transform};
-use crate::{Layer, TileId, World};
+use crate::World;
 use hecs::World as EntityWorld;
 
 const COLLISION_EPSILON: f32 = 0.0001;
@@ -47,62 +47,71 @@ pub fn update_colliders(
             continue;
         }
 
-        let linear_damping = (-collider.linear_drag * dt).exp();
-        collider.velocity[0] *= linear_damping;
-        collider.velocity[1] *= linear_damping;
-        let terminal_velocity = config.terminal_velocity.abs();
-        collider.velocity[1] = (collider.velocity[1]
-            + config.gravity * collider.gravity_scale * dt)
-            .clamp(-terminal_velocity, terminal_velocity);
-        collider.on_ground = false;
-        collider.hit_wall = false;
+        update_collider(transform, collider, terrain, dt, config);
+    }
+}
 
-        move_axis(
-            transform,
-            collider,
-            terrain,
-            0,
-            collider.velocity[0] * dt,
-            config.max_step_distance,
-            dt,
-        );
-        move_axis(
-            transform,
-            collider,
-            terrain,
-            1,
-            collider.velocity[1] * dt,
-            config.max_step_distance,
-            dt,
-        );
+pub(super) fn update_collider(
+    transform: &mut Transform,
+    collider: &mut Collider,
+    terrain: &World,
+    dt: f32,
+    config: PhysicsConfig,
+) {
+    let linear_damping = (-collider.linear_drag * dt).exp();
+    collider.velocity[0] *= linear_damping;
+    collider.velocity[1] *= linear_damping;
+    let terminal_velocity = config.terminal_velocity.abs();
+    collider.velocity[1] = (collider.velocity[1] + config.gravity * collider.gravity_scale * dt)
+        .clamp(-terminal_velocity, terminal_velocity);
+    collider.on_ground = false;
+    collider.hit_wall = false;
 
-        if collider.on_ground {
-            collider.velocity[0] *= (-collider.ground_drag * dt).exp();
-            if collider.velocity[0].abs() < GROUND_SPIN_EPSILON {
-                collider.velocity[0] = 0.0;
-            }
+    move_axis(
+        transform,
+        collider,
+        terrain,
+        0,
+        collider.velocity[0] * dt,
+        config.max_step_distance,
+        dt,
+    );
+    move_axis(
+        transform,
+        collider,
+        terrain,
+        1,
+        collider.velocity[1] * dt,
+        config.max_step_distance,
+        dt,
+    );
+
+    if collider.on_ground {
+        collider.velocity[0] *= (-collider.ground_drag * dt).exp();
+        if collider.velocity[0].abs() < GROUND_SPIN_EPSILON {
+            collider.velocity[0] = 0.0;
         }
+    }
 
-        if collider.rotation_enabled {
-            let rotational_drag = collider.angular_drag
-                + if collider.on_ground {
-                    collider.friction * 4.0
-                } else {
-                    0.0
-                };
-            collider.angular_velocity *= (-rotational_drag * dt).exp();
-            if collider.on_ground
-                && collider.velocity[0].abs() < GROUND_SPIN_EPSILON
-                && collider.angular_velocity.abs() < GROUND_SPIN_EPSILON
-            {
-                collider.angular_velocity = 0.0;
-            }
-            transform.rotation = (transform.rotation + collider.angular_velocity * dt)
-                .rem_euclid(std::f32::consts::TAU);
-        } else {
+    if collider.rotation_enabled {
+        let rotational_drag = collider.angular_drag
+            + if collider.on_ground {
+                collider.friction * 4.0
+            } else {
+                0.0
+            };
+        collider.angular_velocity *= (-rotational_drag * dt).exp();
+        if collider.on_ground
+            && collider.velocity[0].abs() < GROUND_SPIN_EPSILON
+            && collider.angular_velocity.abs() < GROUND_SPIN_EPSILON
+        {
             collider.angular_velocity = 0.0;
-            transform.rotation = 0.0;
         }
+        transform.rotation =
+            (transform.rotation + collider.angular_velocity * dt).rem_euclid(std::f32::consts::TAU);
+    } else {
+        collider.angular_velocity = 0.0;
+        transform.rotation = 0.0;
     }
 }
 
@@ -223,13 +232,13 @@ fn tile_is_solid(terrain: &World, x: i32, y: i32) -> bool {
     if x >= terrain.width() || y >= terrain.height() {
         return true;
     }
-    terrain.tile_in_bounds(x, y, Layer::Foreground) != TileId::EMPTY
+    terrain.is_collision_cell(crate::TilePos::new(x, y))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ForegroundTile;
+    use crate::{BackgroundTile, ForegroundTile, FurnitureObject, Layer, TilePos};
 
     fn floor_world() -> World {
         let mut terrain = World::empty(12, 12, 0).unwrap();
@@ -281,6 +290,31 @@ mod tests {
         let collider = entities.get::<&Collider>(entity).unwrap();
         assert!((transform.position[0] - 4.9999).abs() < 0.001);
         assert!(collider.hit_wall);
+    }
+
+    #[test]
+    fn falling_body_lands_on_a_structural_directional_sentry() {
+        let mut terrain = World::empty(12, 12, 0).unwrap();
+        terrain
+            .set_tile(5, 6, Layer::Background, BackgroundTile::STONE_WALL)
+            .unwrap();
+        terrain
+            .place_furniture(FurnitureObject::DIRECTIONAL_SENTRY, TilePos::new(5, 6))
+            .unwrap();
+        let mut entities = EntityWorld::new();
+        let entity = entities.spawn((
+            Transform::new([5.0, 2.0]),
+            Collider::new(1.0, 1.0)
+                .with_velocity([0.0, 100.0])
+                .with_gravity_scale(0.0),
+        ));
+
+        update_colliders(&mut entities, &terrain, 0.1, PhysicsConfig::default());
+
+        let transform = entities.get::<&Transform>(entity).unwrap();
+        let collider = entities.get::<&Collider>(entity).unwrap();
+        assert!((transform.position[1] - 4.9999).abs() < 0.001);
+        assert!(collider.on_ground);
     }
 
     #[test]

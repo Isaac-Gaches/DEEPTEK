@@ -107,9 +107,12 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let light = textureSample(light_texture, light_sampler, input.light_uv);
         return vec4<f32>(rope_colour, 1.0) * light;
     }
-    if input.visual_kind == 3u || input.visual_kind == 4u {
+    if input.visual_kind >= 3u && input.visual_kind <= 6u {
         var half_width = 0.095;
-        if input.visual_kind == 4u && input.local_uv.y > 0.76 {
+        let has_bottom_terminal = input.visual_kind == 4u || input.visual_kind == 6u;
+        let has_top_terminal = input.visual_kind == 5u || input.visual_kind == 6u;
+        if (has_bottom_terminal && input.local_uv.y > 0.76) ||
+            (has_top_terminal && input.local_uv.y < 0.24) {
             half_width = 0.17;
         }
         let distance = abs(input.local_uv.x - 0.5);

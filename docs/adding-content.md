@@ -31,14 +31,16 @@ world. Register a drop before expecting the laser bore to mine that block.
    as `ItemTransportRole::Input`, `Output`, or `Buffer`.
    To participate in power, chain `with_power(PowerRole, socket_half_tiles)`, followed by
    `with_power_rate` for generators/consumers or `with_power_capacity` for storage. Relays are the
-   automatic 15-tile connection points; `PowerSystem::distribute` budgets generated and stored
+   automatic 22.5-tile connection points; `PowerSystem::distribute` budgets generated and stored
    fixed-point energy, after which consumers query `PowerSystem::is_powered`. Socket offsets use
    exact half-tile units relative to the top-left furniture anchor.
 3. Reserve an item and add `ItemAction::PlaceFurniture` in `built_in_item_definitions`.
    Set its export value on the same definition when appropriate. Add the inventory icon to
    the active item atlas and update `ITEM_ICON_FRAMES`.
 4. Add its world frame to the active furniture atlas and update the atlas dimensions in
-   `src/terrain_renderer/furniture.rs` when adding a row or column.
+   `src/terrain_renderer/furniture/mod.rs` when adding a row or column. Furniture with a
+   procedural visual should add that visual to the same renderer module instead of reserving an
+   unused atlas frame.
 5. Put genuinely new behavior in a focused system. Use `World::objects_of_type` for sparse global
    machines, or the scheduled-object path when behavior naturally follows simulation ticks.
    Occupancy, support validation, containers, save/load, placement preview, removal, and the

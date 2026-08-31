@@ -1,10 +1,10 @@
 use super::{
     BackgroundTile, CHUNK_SIZE, ForegroundTile, Layer, SEA_LEVEL_PERCENT, World, WorldError,
-    available_threads, nature, parallel_mut,
+    available_threads, nature, parallel_mut, structures,
 };
 
 const NOISE_ONE: i64 = 1 << 10;
-const OVERHANG_DEPTH: i64 = 18;
+const OVERHANG_DEPTH: i64 = 8;
 const CAVE_LANES: usize = 3;
 
 /// Deterministic, chunk-parallel terrain generator.
@@ -40,6 +40,7 @@ impl WorldGenerator {
 
     pub fn generate(self, width: u32, height: u32) -> Result<World, WorldError> {
         let mut world = World::empty(width, height, self.seed)?;
+        world.generate_biomes();
         let columns: Vec<_> = (0..width)
             .map(|x| column_profile(self.seed, x, height))
             .collect();
@@ -61,12 +62,16 @@ impl WorldGenerator {
                     let nominal_depth = i64::from(y) - i64::from(profile.surface);
                     let solid = is_ground(self.seed, x, y, height, nominal_depth, profile);
                     if solid {
-                        let foreground = if nominal_depth <= 5
+                        let foreground = if nominal_depth <= OVERHANG_DEPTH
                             && has_air_neighbour(self.seed, x, y, width, height, &columns)
                         {
                             ForegroundTile::GRASS
                         } else if nominal_depth <= 5 {
                             ForegroundTile::DIRT
+                        } else if is_asterite_deposit(self.seed, x, y, height) {
+                            ForegroundTile::ASTERITE
+                        } else if is_iron_deposit(self.seed, x, y, nominal_depth) {
+                            ForegroundTile::IRON_ORE
                         } else {
                             ForegroundTile::STONE
                         };
@@ -87,8 +92,81 @@ impl WorldGenerator {
             }
         })?;
         nature::populate_natural_objects(&mut world);
+        let surfaces: Vec<_> = columns.iter().map(|profile| profile.surface).collect();
+        structures::populate_generated_structures(&mut world, &surfaces)?;
         Ok(world)
     }
+}
+
+const IRON_DEPOSIT_CELL_WIDTH: u32 = 960;
+const IRON_DEPOSIT_CELL_HEIGHT: u32 = 800;
+
+/// Places one broad, irregular iron lens per coarse underground cell. Nearby
+/// cells are checked so formations remain seamless across both cell and chunk
+/// boundaries without a world-sized resource map.
+#[inline]
+fn is_iron_deposit(seed: u64, x: u32, y: u32, nominal_depth: i64) -> bool {
+    if nominal_depth < 18 {
+        return false;
+    }
+    let cell_x = x / IRON_DEPOSIT_CELL_WIDTH;
+    let cell_y = y / IRON_DEPOSIT_CELL_HEIGHT;
+    for neighbour_y in cell_y.saturating_sub(1)..=cell_y.saturating_add(1) {
+        for neighbour_x in cell_x.saturating_sub(1)..=cell_x.saturating_add(1) {
+            let key = (u64::from(neighbour_y) << 32) | u64::from(neighbour_x);
+            let hash = hash_value(seed ^ 0x1A0F_EA57_D3B0_5175, key);
+            let centre_x = u64::from(neighbour_x) * u64::from(IRON_DEPOSIT_CELL_WIDTH)
+                + hash % u64::from(IRON_DEPOSIT_CELL_WIDTH);
+            let centre_y = u64::from(neighbour_y) * u64::from(IRON_DEPOSIT_CELL_HEIGHT)
+                + (hash >> 16) % u64::from(IRON_DEPOSIT_CELL_HEIGHT);
+            let radius_x = 140 + ((hash >> 32) % 141) as i64;
+            let radius_y = 70 + ((hash >> 40) % 81) as i64;
+            let dx = i64::from(x) - centre_x as i64;
+            let dy = i64::from(y) - centre_y as i64;
+            let distortion = noise_2d(seed ^ key ^ 0x10A0_0E11, x, y, 4) / 8;
+            let threshold = NOISE_ONE + distortion;
+            let scaled = dx * dx * radius_y * radius_y + dy * dy * radius_x * radius_x;
+            let limit = radius_x * radius_x * radius_y * radius_y * threshold / NOISE_ONE;
+            if scaled <= limit {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Rare Asterite lenses occupy the deepest stratum. The relative depth keeps
+/// the primary objective reachable in every supported world size while the
+/// licence briefing retains its approximate ten-kilometre geological estimate.
+#[inline]
+fn is_asterite_deposit(seed: u64, x: u32, y: u32, height: u32) -> bool {
+    if y < height.saturating_mul(86) / 100 {
+        return false;
+    }
+    const CELL_WIDTH: u32 = 1_600;
+    const CELL_HEIGHT: u32 = 900;
+    let cell_x = x / CELL_WIDTH;
+    let cell_y = y / CELL_HEIGHT;
+    for neighbour_y in cell_y.saturating_sub(1)..=cell_y.saturating_add(1) {
+        for neighbour_x in cell_x.saturating_sub(1)..=cell_x.saturating_add(1) {
+            let key = (u64::from(neighbour_y) << 32) | u64::from(neighbour_x);
+            let hash = hash_value(seed ^ 0xA57E_817E_D33F_0001, key);
+            let centre_x =
+                u64::from(neighbour_x) * u64::from(CELL_WIDTH) + hash % u64::from(CELL_WIDTH);
+            let centre_y = u64::from(neighbour_y) * u64::from(CELL_HEIGHT)
+                + (hash >> 16) % u64::from(CELL_HEIGHT);
+            let radius_x = 70 + ((hash >> 32) % 91) as i64;
+            let radius_y = 35 + ((hash >> 40) % 51) as i64;
+            let dx = i64::from(x) - centre_x as i64;
+            let dy = i64::from(y) - centre_y as i64;
+            if dx * dx * radius_y * radius_y + dy * dy * radius_x * radius_x
+                <= radius_x * radius_x * radius_y * radius_y
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Uses the same eight-neighbour footprint as the marching-squares renderer.
@@ -135,27 +213,14 @@ fn column_profile(seed: u64, x: u32, height: u32) -> ColumnProfile {
 
     let height_i = i64::from(height);
     let base = height_i * i64::from(SEA_LEVEL_PERCENT) / 100;
-    let broad_hills = noise_1d(seed ^ 0xA11C_E551, x, 9) * height_i / (NOISE_ONE * 9);
-    let foothills = noise_1d(seed ^ 0xB04D_1E55, x, 7) * height_i / (NOISE_ONE * 20);
-
-    // A ridged low-frequency signal makes occasional tall mountain chains.
-    let ridge_noise = noise_1d(seed ^ 0xC0FF_EE11, x, 8).abs();
-    let mountain = (NOISE_ONE - ridge_noise).max(0) * height_i / (NOISE_ONE * 7);
-
-    // Quantised continental noise creates true rock faces instead of making
-    // every elevation change a shallow walkable slope.
-    let plateau = noise_1d(seed ^ 0xC11F_F5E7, x, 8);
-    let cliff = if plateau > NOISE_ONE / 3 {
-        -(height_i / 14)
-    } else if plateau < -NOISE_ONE / 3 {
-        height_i / 18
-    } else {
-        0
-    };
+    // Surface relief is deliberately shallow and uses an absolute cap so tall
+    // worlds gain underground depth rather than proportionally taller mountains.
+    let relief = (height_i / 320).clamp(2, 48);
+    let broad_hills = noise_1d(seed ^ 0xA11C_E551, x, 9) * relief / NOISE_ONE;
+    let foothills = noise_1d(seed ^ 0xB04D_1E55, x, 7) * relief / (NOISE_ONE * 4);
 
     let margin = (height_i / 12).clamp(1, 24);
-    let surface = (base + broad_hills + foothills - mountain + cliff)
-        .clamp(margin, height_i - margin.max(2)) as u32;
+    let surface = (base + broad_hills + foothills).clamp(margin, height_i - margin.max(2)) as u32;
 
     let mut cave_centres = [0; CAVE_LANES];
     let mut cave_radius_sq = [0; CAVE_LANES];
@@ -196,7 +261,7 @@ fn is_ground(
     if nominal_depth.abs() <= OVERHANG_DEPTH {
         let coarse = noise_2d(seed ^ 0x00AE_2AA9, x, y, 4);
         let detail = noise_2d(seed ^ 0x00DE_7A11, x, y, 3) / 3;
-        let displacement = (coarse + detail) * 10 / NOISE_ONE;
+        let displacement = (coarse + detail) * 5 / NOISE_ONE;
         solid = nominal_depth + displacement >= 0;
     }
     if !solid || nominal_depth < 9 || y + 3 >= height {
@@ -268,13 +333,18 @@ fn lerp(left: i64, right: i64, weight: i64) -> i64 {
 
 #[inline]
 fn hash_signed(seed: u64, position: u64) -> i64 {
+    (hash_value(seed, position) & 0x7ff) as i64 - NOISE_ONE
+}
+
+#[inline]
+fn hash_value(seed: u64, position: u64) -> u64 {
     let mut value = seed ^ position.wrapping_mul(0x9E37_79B9_7F4A_7C15);
     value ^= value >> 30;
     value = value.wrapping_mul(0xBF58_476D_1CE4_E5B9);
     value ^= value >> 27;
     value = value.wrapping_mul(0x94D0_49BB_1331_11EB);
     value ^= value >> 31;
-    (value & 0x7ff) as i64 - NOISE_ONE
+    value
 }
 
 #[cfg(test)]
@@ -309,6 +379,35 @@ mod tests {
         assert_ne!(
             world.tile(50, 99, Layer::Background).unwrap(),
             BackgroundTile::NONE
+        );
+    }
+
+    #[test]
+    fn generated_world_contains_large_iron_formations() {
+        let world = WorldGenerator::new(0x1A0F_EA57)
+            .generate(1_024, 700)
+            .unwrap();
+        let mut total_iron = 0;
+        let mut densest_chunk = 0;
+        for (chunk_position, chunk) in world.chunks() {
+            let iron = chunk
+                .tiles(Layer::Foreground)
+                .iter()
+                .filter(|&&tile| tile == ForegroundTile::IRON_ORE)
+                .count();
+            total_iron += iron;
+            if chunk_position.y > 0 {
+                densest_chunk = densest_chunk.max(iron);
+            }
+        }
+
+        assert!(
+            total_iron > 5_000,
+            "expected iron deposits across the world"
+        );
+        assert!(
+            densest_chunk > 1_000,
+            "expected at least one formation to fill a substantial part of a chunk"
         );
     }
 
@@ -351,8 +450,8 @@ mod tests {
         }
 
         assert!(
-            surface_max - surface_min >= 30,
-            "expected substantial terrain relief"
+            surface_max - surface_min <= 16,
+            "expected the surface to remain broadly level"
         );
         assert!(
             overhang_columns >= 100,
@@ -430,7 +529,7 @@ mod tests {
                         ForegroundTile::GRASS
                     );
                 }
-                _ => unreachable!("generator emitted an unknown natural object"),
+                _ => {}
             }
             world
                 .objects_in_chunk(object.anchor().chunk())

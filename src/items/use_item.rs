@@ -1,10 +1,12 @@
 use super::{
-    ConsumableAction, Inventory, ItemAction, ItemId, ItemRegistry, ProjectileKind, ToolAction,
+    ConsumableAction, DroppedItemSystem, Inventory, ItemAction, ItemRegistry, ProjectileKind,
+    ToolAction,
 };
 use crate::{
-    Collider, FurnitureObject, Health, Layer, ObjectTypeId, POWERED_CABLE_OBJECT, ROPE_OBJECT,
-    TerrainRenderer, TileId, TilePos, Transform, World, furniture_definition,
+    Collider, FurnitureFacing, FurnitureObject, Health, Layer, ObjectTypeId, TerrainRenderer,
+    TileId, TilePos, Transform, World, background_tile_for, furniture_definition,
 };
+use easy_gpu::{assets::Material, assets_manager::Handle};
 use hecs::{Entity, World as EntityWorld};
 
 /// The prototype does not impose an interaction radius. Callers can still pass
@@ -17,6 +19,7 @@ pub enum ItemUseResult {
     OutOfReach,
     Blocked,
     Placed(TilePos),
+    Damaged(TilePos),
     Removed(TilePos),
     Consumed,
     Thrown(ProjectileKind),
@@ -29,6 +32,32 @@ pub enum ItemTargetStatus {
     Valid(TilePos),
     OutOfReach(TilePos),
     Blocked(TilePos),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ItemUseMode {
+    Primary,
+    Background,
+}
+
+impl ItemUseMode {
+    fn resolve(self, action: ItemAction) -> Option<ItemAction> {
+        match (self, action) {
+            (Self::Primary, action) => Some(action),
+            (Self::Background, ItemAction::PlaceTile { tile, .. }) => background_tile_for(tile)
+                .map(|tile| ItemAction::PlaceTile {
+                    layer: Layer::Background,
+                    tile,
+                }),
+            (Self::Background, ItemAction::Tool(ToolAction::RemoveTile { power, .. })) => {
+                Some(ItemAction::Tool(ToolAction::RemoveTile {
+                    layer: Layer::Background,
+                    power,
+                }))
+            }
+            (Self::Background, _) => None,
+        }
+    }
 }
 
 pub fn selected_item_target_status(
@@ -46,7 +75,25 @@ pub fn selected_item_target_status(
     let Some(definition) = registry.get(stack.item()) else {
         return ItemTargetStatus::NotTargeted;
     };
-    match definition.action {
+    selected_item_target_status_for_action(
+        definition.action,
+        terrain,
+        entities,
+        user,
+        target,
+        reach,
+    )
+}
+
+fn selected_item_target_status_for_action(
+    action: ItemAction,
+    terrain: &World,
+    entities: &EntityWorld,
+    user: Entity,
+    target: Option<TilePos>,
+    reach: f32,
+) -> ItemTargetStatus {
+    match action {
         ItemAction::PlaceTile { layer, .. } => {
             let Some(target) = target else {
                 return ItemTargetStatus::NotTargeted;
@@ -138,8 +185,7 @@ pub fn selected_item_target_status(
             if !target_in_reach(entities, user, target, reach) {
                 ItemTargetStatus::OutOfReach(target)
             } else if object
-                .is_some_and(|object| terrain.container_is_empty(object.id()) == Some(false))
-                || object.is_some_and(|object| !terrain.can_remove_object(object.id()))
+                .is_some_and(|object| !terrain.can_remove_object_with_dependents(object.id()))
                 || terrain.tile(target.x, target.y, layer).ok() == Some(TileId::EMPTY)
                     && object.is_none()
             {
@@ -158,10 +204,71 @@ pub fn use_selected_item(
     registry: &ItemRegistry,
     terrain: &mut World,
     renderer: &mut TerrainRenderer,
+    dropped_items: &mut DroppedItemSystem,
+    dropped_item_material: Handle<Material>,
     entities: &mut EntityWorld,
     user: Entity,
     target: Option<TilePos>,
     reach: f32,
+) -> ItemUseResult {
+    use_selected_item_with_mode(
+        inventory,
+        registry,
+        terrain,
+        renderer,
+        dropped_items,
+        dropped_item_material,
+        entities,
+        user,
+        target,
+        reach,
+        ItemUseMode::Primary,
+    )
+}
+
+/// Uses the selected placeable block or tool against the background layer.
+/// Other item actions remain reserved for their normal primary interaction.
+#[allow(clippy::too_many_arguments)]
+pub fn use_selected_item_in_background(
+    inventory: &mut Inventory,
+    registry: &ItemRegistry,
+    terrain: &mut World,
+    renderer: &mut TerrainRenderer,
+    dropped_items: &mut DroppedItemSystem,
+    dropped_item_material: Handle<Material>,
+    entities: &mut EntityWorld,
+    user: Entity,
+    target: Option<TilePos>,
+    reach: f32,
+) -> ItemUseResult {
+    use_selected_item_with_mode(
+        inventory,
+        registry,
+        terrain,
+        renderer,
+        dropped_items,
+        dropped_item_material,
+        entities,
+        user,
+        target,
+        reach,
+        ItemUseMode::Background,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn use_selected_item_with_mode(
+    inventory: &mut Inventory,
+    registry: &ItemRegistry,
+    terrain: &mut World,
+    renderer: &mut TerrainRenderer,
+    dropped_items: &mut DroppedItemSystem,
+    dropped_item_material: Handle<Material>,
+    entities: &mut EntityWorld,
+    user: Entity,
+    target: Option<TilePos>,
+    reach: f32,
+    mode: ItemUseMode,
 ) -> ItemUseResult {
     let Some(stack) = inventory.selected_stack() else {
         return ItemUseResult::NoItem;
@@ -169,9 +276,12 @@ pub fn use_selected_item(
     let Some(definition) = registry.get(stack.item()) else {
         return ItemUseResult::Unsupported;
     };
+    let Some(action) = mode.resolve(definition.action) else {
+        return ItemUseResult::Unsupported;
+    };
     let target_status =
-        selected_item_target_status(inventory, registry, terrain, entities, user, target, reach);
-    match definition.action {
+        selected_item_target_status_for_action(action, terrain, entities, user, target, reach);
+    match action {
         ItemAction::PlaceTile { layer, tile } => {
             let target = match valid_target_or_result(target_status) {
                 Ok(target) => target,
@@ -192,7 +302,11 @@ pub fn use_selected_item(
                 Ok(target) => target,
                 Err(result) => return result,
             };
-            if terrain.place_furniture(object_type, anchor).is_err() {
+            let facing = placement_facing(entities, user, object_type, anchor);
+            if terrain
+                .place_furniture_facing(object_type, anchor, facing)
+                .is_err()
+            {
                 return ItemUseResult::Blocked;
             }
             inventory.consume_selected(1);
@@ -235,41 +349,29 @@ pub fn use_selected_item(
             inventory.consume_selected(1);
             ItemUseResult::Placed(anchor)
         }
-        ItemAction::Tool(ToolAction::RemoveTile { layer, .. }) => {
+        ItemAction::Tool(ToolAction::RemoveTile { layer, power }) => {
             let target = match valid_target_or_result(target_status) {
                 Ok(target) => target,
                 Err(result) => return result,
             };
-            if layer == Layer::Foreground
-                && let Some(existing) = terrain.object_at(target)
-                && !terrain.can_remove_object(existing.id())
-            {
-                return ItemUseResult::Blocked;
-            }
-            if layer == Layer::Foreground
-                && let Some(object) = terrain.remove_object_at(target)
-            {
-                let drop = if object.object_type() == ROPE_OBJECT {
-                    Some((ItemId::ROPE, object.size()[1]))
-                } else if object.object_type() == POWERED_CABLE_OBJECT {
-                    Some((ItemId::POWERED_CABLE, object.size()[1]))
-                } else {
-                    registry
-                        .item_for_furniture(object.object_type())
-                        .map(|item| (item, 1))
-                };
-                if let Some((item, quantity)) = drop {
-                    let _remaining = inventory.add(item, quantity, registry);
-                }
-                return ItemUseResult::Removed(object.anchor());
-            }
-            if renderer
-                .set_tile(terrain, target.x, target.y, layer, TileId::EMPTY)
-                .is_err()
-            {
-                return ItemUseResult::Blocked;
-            }
-            ItemUseResult::Removed(target)
+            dropped_items
+                .damage_target(
+                    entities,
+                    dropped_item_material,
+                    registry,
+                    terrain,
+                    renderer,
+                    target,
+                    layer,
+                    power,
+                )
+                .map_or(ItemUseResult::Blocked, |broken| {
+                    if broken {
+                        ItemUseResult::Removed(target)
+                    } else {
+                        ItemUseResult::Damaged(target)
+                    }
+                })
         }
         ItemAction::Consume(ConsumableAction::Heal { amount }) => {
             let Ok(mut health) = entities.get::<&mut Health>(user) else {
@@ -287,6 +389,29 @@ pub fn use_selected_item(
             ItemUseResult::Thrown(projectile)
         }
         ItemAction::None | ItemAction::Custom(_) => ItemUseResult::Unsupported,
+    }
+}
+
+fn placement_facing(
+    entities: &EntityWorld,
+    user: Entity,
+    object_type: ObjectTypeId,
+    anchor: TilePos,
+) -> FurnitureFacing {
+    let Some(definition) =
+        furniture_definition(object_type).filter(|value| value.supports_facing())
+    else {
+        return FurnitureFacing::Right;
+    };
+    let user_x = entities
+        .get::<&Transform>(user)
+        .ok()
+        .map_or(anchor.x as f32, |transform| transform.position[0]);
+    let object_centre_x = anchor.x as f32 + (f32::from(definition.size()[0]) - 1.0) * 0.5;
+    if object_centre_x < user_x {
+        FurnitureFacing::Left
+    } else {
+        FurnitureFacing::Right
     }
 }
 
@@ -371,10 +496,75 @@ mod tests {
     }
 
     #[test]
+    fn background_mode_maps_blocks_and_tools_without_affecting_other_items() {
+        assert_eq!(
+            ItemUseMode::Background.resolve(ItemAction::PlaceTile {
+                layer: Layer::Foreground,
+                tile: crate::ForegroundTile::DIRT,
+            }),
+            Some(ItemAction::PlaceTile {
+                layer: Layer::Background,
+                tile: crate::BackgroundTile::DIRT_WALL,
+            })
+        );
+        assert_eq!(
+            ItemUseMode::Background.resolve(ItemAction::Tool(ToolAction::RemoveTile {
+                layer: Layer::Foreground,
+                power: 3,
+            })),
+            Some(ItemAction::Tool(ToolAction::RemoveTile {
+                layer: Layer::Background,
+                power: 3,
+            }))
+        );
+        assert_eq!(
+            ItemUseMode::Background.resolve(ItemAction::PlaceTile {
+                layer: Layer::Foreground,
+                tile: TileId::new(4),
+            }),
+            None
+        );
+        assert_eq!(ItemUseMode::Background.resolve(ItemAction::PlaceRope), None);
+    }
+
+    #[test]
+    fn directional_furniture_faces_away_from_the_placing_player() {
+        let mut entities = EntityWorld::new();
+        let player = entities.spawn((Transform::new([4.0, 4.0]),));
+        assert_eq!(
+            placement_facing(
+                &entities,
+                player,
+                FurnitureObject::TURRET,
+                TilePos::new(8, 4)
+            ),
+            FurnitureFacing::Right
+        );
+        assert_eq!(
+            placement_facing(
+                &entities,
+                player,
+                FurnitureObject::AMMO_TURRET,
+                TilePos::new(1, 4)
+            ),
+            FurnitureFacing::Left
+        );
+        assert_eq!(
+            placement_facing(
+                &entities,
+                player,
+                FurnitureObject::CHEST,
+                TilePos::new(1, 4)
+            ),
+            FurnitureFacing::Right
+        );
+    }
+
+    #[test]
     fn placement_status_explains_valid_blocked_and_out_of_reach_targets() {
         const TEST_REACH: f32 = 8.0;
         let registry = ItemRegistry::with_built_ins();
-        let inventory = Inventory::starter(&registry);
+        let inventory = Inventory::test_loadout(&registry);
         let mut terrain = World::empty(20, 20, 0).unwrap();
         for support in [TilePos::new(7, 5), TilePos::new(15, 5)] {
             terrain
@@ -465,7 +655,7 @@ mod tests {
     #[test]
     fn furniture_target_uses_the_bottom_left_cursor_tile_and_full_footprint() {
         let registry = ItemRegistry::with_built_ins();
-        let mut inventory = Inventory::starter(&registry);
+        let mut inventory = Inventory::test_loadout(&registry);
         inventory.select_hotbar(7);
         let mut terrain = World::empty(20, 20, 0).unwrap();
         for x in 7..=8 {
@@ -513,7 +703,7 @@ mod tests {
     #[test]
     fn furniture_placement_is_valid_when_its_footprint_overlaps_the_player() {
         let registry = ItemRegistry::with_built_ins();
-        let mut inventory = Inventory::starter(&registry);
+        let mut inventory = Inventory::test_loadout(&registry);
         inventory.select_hotbar(7);
         let mut terrain = World::empty(12, 12, 0).unwrap();
         for x in 3..=4 {
@@ -541,7 +731,7 @@ mod tests {
     #[test]
     fn laser_bore_target_previews_its_three_by_three_footprint() {
         let registry = ItemRegistry::with_built_ins();
-        let mut inventory = Inventory::starter(&registry);
+        let mut inventory = Inventory::test_loadout(&registry);
         inventory.select_hotbar(8);
         let mut terrain = World::empty(20, 20, 0).unwrap();
         for x in [7, 9] {

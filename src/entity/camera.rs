@@ -2,11 +2,14 @@
 pub struct FollowCamera {
     position: [f32; 2],
     vertical_tiles_visible: f32,
+    target_vertical_tiles_visible: f32,
     follow_rate: f32,
+    zoom_rate: f32,
+    maximum_vertical_tiles_visible: f32,
 }
 
 const MIN_VERTICAL_TILES_VISIBLE: f32 = 12.0;
-const MAX_VERTICAL_TILES_VISIBLE: f32 = 120.0;
+const DEFAULT_MAX_VERTICAL_TILES_VISIBLE: f32 = 120.0;
 const ZOOM_STEP: f32 = 1.15;
 
 impl FollowCamera {
@@ -14,7 +17,10 @@ impl FollowCamera {
         Self {
             position,
             vertical_tiles_visible: vertical_tiles_visible.max(2.0),
+            target_vertical_tiles_visible: vertical_tiles_visible.max(2.0),
             follow_rate: 8.0,
+            zoom_rate: 12.0,
+            maximum_vertical_tiles_visible: DEFAULT_MAX_VERTICAL_TILES_VISIBLE,
         }
     }
 
@@ -27,17 +33,32 @@ impl FollowCamera {
     }
 
     pub fn set_vertical_tiles_visible(&mut self, tiles: f32) {
-        self.vertical_tiles_visible = tiles.max(2.0);
+        let tiles = tiles.clamp(
+            MIN_VERTICAL_TILES_VISIBLE,
+            self.maximum_vertical_tiles_visible,
+        );
+        self.vertical_tiles_visible = tiles;
+        self.target_vertical_tiles_visible = tiles;
+    }
+
+    pub fn set_maximum_vertical_tiles_visible(&mut self, tiles: f32) {
+        self.maximum_vertical_tiles_visible = tiles.max(MIN_VERTICAL_TILES_VISIBLE);
+        self.vertical_tiles_visible = self
+            .vertical_tiles_visible
+            .min(self.maximum_vertical_tiles_visible);
+        self.target_vertical_tiles_visible = self
+            .target_vertical_tiles_visible
+            .min(self.maximum_vertical_tiles_visible);
     }
 
     pub fn zoom_in(&mut self) {
-        self.vertical_tiles_visible =
-            (self.vertical_tiles_visible / ZOOM_STEP).max(MIN_VERTICAL_TILES_VISIBLE);
+        self.target_vertical_tiles_visible =
+            (self.target_vertical_tiles_visible / ZOOM_STEP).max(MIN_VERTICAL_TILES_VISIBLE);
     }
 
     pub fn zoom_out(&mut self) {
-        self.vertical_tiles_visible =
-            (self.vertical_tiles_visible * ZOOM_STEP).min(MAX_VERTICAL_TILES_VISIBLE);
+        self.target_vertical_tiles_visible = (self.target_vertical_tiles_visible * ZOOM_STEP)
+            .min(self.maximum_vertical_tiles_visible);
     }
 
     pub fn set_follow_rate(&mut self, follow_rate: f32) {
@@ -49,9 +70,13 @@ impl FollowCamera {
     }
 
     pub fn follow(&mut self, target: [f32; 2], elapsed: f32) {
-        let blend = 1.0 - (-self.follow_rate * elapsed.clamp(0.0, 0.1)).exp();
+        let elapsed = elapsed.clamp(0.0, 0.1);
+        let blend = 1.0 - (-self.follow_rate * elapsed).exp();
         self.position[0] += (target[0] - self.position[0]) * blend;
         self.position[1] += (target[1] - self.position[1]) * blend;
+        let zoom_blend = 1.0 - (-self.zoom_rate * elapsed).exp();
+        self.vertical_tiles_visible +=
+            (self.target_vertical_tiles_visible - self.vertical_tiles_visible) * zoom_blend;
     }
 
     pub fn screen_to_world(&self, pixel: [f32; 2], viewport: [f32; 2]) -> [f32; 2] {
@@ -129,21 +154,34 @@ mod tests {
     }
 
     #[test]
-    fn zoom_uses_bounded_multiplicative_steps() {
+    fn zoom_moves_continuously_towards_a_bounded_target() {
         let mut camera = FollowCamera::default();
         let initial = camera.vertical_tiles_visible();
         camera.zoom_in();
+        assert_eq!(camera.vertical_tiles_visible(), initial);
+        camera.follow(camera.position(), 1.0 / 60.0);
         assert!(camera.vertical_tiles_visible() < initial);
         camera.zoom_out();
-        assert!((camera.vertical_tiles_visible() - initial).abs() < 0.0001);
+        for _ in 0..60 {
+            camera.follow(camera.position(), 1.0 / 60.0);
+        }
+        assert!((camera.vertical_tiles_visible() - initial).abs() < 0.01);
 
         for _ in 0..100 {
             camera.zoom_in();
         }
-        assert_eq!(camera.vertical_tiles_visible(), MIN_VERTICAL_TILES_VISIBLE);
+        for _ in 0..60 {
+            camera.follow(camera.position(), 1.0 / 60.0);
+        }
+        assert!((camera.vertical_tiles_visible() - MIN_VERTICAL_TILES_VISIBLE).abs() < 0.01);
         for _ in 0..100 {
             camera.zoom_out();
         }
-        assert_eq!(camera.vertical_tiles_visible(), MAX_VERTICAL_TILES_VISIBLE);
+        for _ in 0..60 {
+            camera.follow(camera.position(), 1.0 / 60.0);
+        }
+        assert!(
+            (camera.vertical_tiles_visible() - DEFAULT_MAX_VERTICAL_TILES_VISIBLE).abs() < 0.01
+        );
     }
 }

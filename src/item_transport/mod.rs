@@ -1,3 +1,6 @@
+//! Revision-driven item transport networks and transfers.
+
+use crate::machine_processing::{transfer_one_from_processor, transfer_one_to_processor};
 use crate::{
     BUILT_IN_FURNITURE, ItemRegistry, ItemTransportRole, ObjectId, TilePos, World,
     furniture_definition,
@@ -7,10 +10,14 @@ use std::time::Duration;
 
 pub const DEFAULT_ITEM_TRANSPORT_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_CATCH_UP_TICKS: usize = 20;
-const ROUTE_PHASES: [(ItemTransportRole, ItemTransportRole); 3] = [
+const ROUTE_PHASES: [(ItemTransportRole, ItemTransportRole); 7] = [
+    (ItemTransportRole::Processor, ItemTransportRole::Input),
+    (ItemTransportRole::Processor, ItemTransportRole::Buffer),
     (ItemTransportRole::Output, ItemTransportRole::Input),
+    (ItemTransportRole::Output, ItemTransportRole::Processor),
     (ItemTransportRole::Output, ItemTransportRole::Buffer),
     (ItemTransportRole::Buffer, ItemTransportRole::Input),
+    (ItemTransportRole::Buffer, ItemTransportRole::Processor),
 ];
 
 /// The visual path through a one-tile item transport connector.
@@ -82,6 +89,7 @@ pub struct ItemTransportUpdate {
     pub network_count: usize,
     pub transfer_count: usize,
     pub items_transferred: u64,
+    pub processor_items_received: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -140,6 +148,16 @@ impl ItemTransportSystem {
         registry: &ItemRegistry,
         elapsed_seconds: f32,
     ) -> ItemTransportUpdate {
+        self.update_with_speed(world, registry, elapsed_seconds, 100)
+    }
+
+    pub fn update_with_speed(
+        &mut self,
+        world: &mut World,
+        registry: &ItemRegistry,
+        elapsed_seconds: f32,
+        speed_percent: u16,
+    ) -> ItemTransportUpdate {
         let revision = world.item_transport_revision();
         let topology_rebuilt = self.known_topology_revision != Some(revision);
         if topology_rebuilt {
@@ -152,12 +170,13 @@ impl ItemTransportSystem {
         if elapsed_seconds.is_finite() && elapsed_seconds > 0.0 {
             self.accumulator_seconds += f64::from(elapsed_seconds);
         }
-        let elapsed_ticks = (self.accumulator_seconds / self.interval_seconds).floor() as usize;
+        let effective_interval = self.interval_seconds * 100.0 / f64::from(speed_percent.max(1));
+        let elapsed_ticks = (self.accumulator_seconds / effective_interval).floor() as usize;
         let ticks = elapsed_ticks.min(MAX_CATCH_UP_TICKS);
         if elapsed_ticks > MAX_CATCH_UP_TICKS {
-            self.accumulator_seconds %= self.interval_seconds;
+            self.accumulator_seconds %= effective_interval;
         } else {
-            self.accumulator_seconds -= ticks as f64 * self.interval_seconds;
+            self.accumulator_seconds -= ticks as f64 * effective_interval;
         }
 
         let mut update = ItemTransportUpdate {
@@ -168,9 +187,13 @@ impl ItemTransportSystem {
         };
         for _ in 0..ticks {
             for network in &self.networks {
-                if transfer_one_item(world, registry, network) {
+                if let Some(processor_received) = transfer_one_item(world, registry, network) {
                     update.transfer_count += 1;
                     update.items_transferred = update.items_transferred.saturating_add(1);
+                    if processor_received {
+                        update.processor_items_received =
+                            update.processor_items_received.saturating_add(1);
+                    }
                 }
             }
         }
@@ -291,13 +314,16 @@ fn transfer_one_item(
     world: &mut World,
     registry: &ItemRegistry,
     network: &TransportNetwork,
-) -> bool {
+) -> Option<bool> {
     for (source_role, destination_role) in ROUTE_PHASES {
         for source in network
             .endpoints
             .iter()
             .filter(|endpoint| endpoint.role == source_role)
         {
+            if !machine_endpoint_is_operational(world, source.object) {
+                continue;
+            }
             let source_slots = world
                 .container(source.object)
                 .map_or(0, |container| container.slots().len());
@@ -316,6 +342,31 @@ fn transfer_one_item(
                 for destination in network.endpoints.iter().filter(|endpoint| {
                     endpoint.role == destination_role && endpoint.object != source.object
                 }) {
+                    if !machine_endpoint_is_operational(world, destination.object) {
+                        continue;
+                    }
+                    if destination.role == ItemTransportRole::Processor {
+                        if transfer_one_to_processor(
+                            world,
+                            source.object,
+                            destination.object,
+                            registry,
+                        ) {
+                            return Some(true);
+                        }
+                        continue;
+                    }
+                    if source.role == ItemTransportRole::Processor {
+                        if transfer_one_from_processor(
+                            world,
+                            source.object,
+                            destination.object,
+                            registry,
+                        ) {
+                            return Some(false);
+                        }
+                        continue;
+                    }
                     let can_add = world
                         .container(destination.object)
                         .is_some_and(|container| container.can_add(item, 1, max_stack));
@@ -327,13 +378,19 @@ fn transfer_one_item(
                         destination.object,
                         registry,
                     ) {
-                        return true;
+                        return Some(false);
                     }
                 }
             }
         }
     }
-    false
+    None
+}
+
+fn machine_endpoint_is_operational(world: &World, object: ObjectId) -> bool {
+    world
+        .machine_health(object)
+        .is_none_or(|health| !health.is_disabled())
 }
 
 fn adjacent_positions(position: TilePos, width: u32, height: u32) -> impl Iterator<Item = TilePos> {
@@ -406,309 +463,4 @@ impl UnionFind {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{ForegroundTile, FurnitureObject, ItemId, ItemStack, Layer};
-
-    fn connected_machines() -> (World, ObjectId, ObjectId) {
-        let mut world = World::empty(32, 16, 0).unwrap();
-        for x in 2..=12 {
-            world
-                .set_tile(x, 9, Layer::Foreground, ForegroundTile::STONE)
-                .unwrap();
-        }
-        let bore = world
-            .place_furniture(FurnitureObject::LASER_BORE, TilePos::new(2, 6))
-            .unwrap();
-        for x in 5..=9 {
-            world
-                .place_furniture(FurnitureObject::CARGO_CONVEYOR, TilePos::new(x, 8))
-                .unwrap();
-        }
-        let launcher = world
-            .place_furniture(
-                FurnitureObject::ORBITAL_EXPORT_LAUNCHER,
-                TilePos::new(10, 6),
-            )
-            .unwrap();
-        (world, bore, launcher)
-    }
-
-    #[test]
-    fn connected_drill_output_moves_to_exporter_off_screen() {
-        let registry = ItemRegistry::with_built_ins();
-        let (mut world, bore, launcher) = connected_machines();
-        assert!(
-            world
-                .container_mut(bore)
-                .unwrap()
-                .set_slot(0, ItemStack::new(ItemId::STONE_BLOCK, 24))
-        );
-        let mut system = ItemTransportSystem::default();
-
-        let initial = system.update(&mut world, &registry, 0.0);
-        assert!(initial.topology_rebuilt);
-        assert_eq!(initial.connector_count, 5);
-        assert_eq!(initial.network_count, 1);
-        assert_eq!(initial.transfer_count, 0);
-
-        let moved = system.update(&mut world, &registry, 1.0);
-        assert_eq!(moved.transfer_count, 20);
-        assert_eq!(moved.items_transferred, 20);
-        assert_eq!(
-            world.container(bore).unwrap().slot(0),
-            ItemStack::new(ItemId::STONE_BLOCK, 4)
-        );
-        assert_eq!(
-            world.container(launcher).unwrap().slot(0),
-            ItemStack::new(ItemId::STONE_BLOCK, 20)
-        );
-    }
-
-    #[test]
-    fn input_machines_never_feed_items_backward_into_outputs() {
-        let registry = ItemRegistry::with_built_ins();
-        let (mut world, bore, launcher) = connected_machines();
-        assert!(
-            world
-                .container_mut(launcher)
-                .unwrap()
-                .set_slot(0, ItemStack::new(ItemId::DIRT_BLOCK, 8))
-        );
-        let mut system = ItemTransportSystem::default();
-        system.update(&mut world, &registry, 0.0);
-
-        assert_eq!(system.update(&mut world, &registry, 1.0).transfer_count, 0);
-        assert!(world.container(bore).unwrap().is_empty());
-        assert_eq!(
-            world.container(launcher).unwrap().slot(0),
-            ItemStack::new(ItemId::DIRT_BLOCK, 8)
-        );
-    }
-
-    #[test]
-    fn a_gap_keeps_endpoints_in_separate_networks() {
-        let registry = ItemRegistry::with_built_ins();
-        let (mut world, bore, launcher) = connected_machines();
-        assert!(world.remove_object_at(TilePos::new(7, 8)).is_some());
-        assert!(
-            world
-                .container_mut(bore)
-                .unwrap()
-                .set_slot(0, ItemStack::new(ItemId::STONE_BLOCK, 3))
-        );
-        let mut system = ItemTransportSystem::default();
-
-        let update = system.update(&mut world, &registry, 1.0);
-        assert!(update.topology_rebuilt);
-        assert_eq!(update.network_count, 0);
-        assert_eq!(update.transfer_count, 0);
-        assert!(world.container(launcher).unwrap().is_empty());
-    }
-
-    #[test]
-    fn empty_buffer_accepts_output_when_no_input_machine_is_connected() {
-        let registry = ItemRegistry::with_built_ins();
-        let (mut world, bore, launcher) = connected_machines();
-        assert!(world.remove_object(launcher).is_some());
-        for x in 10..=11 {
-            world
-                .set_tile(x, 9, Layer::Foreground, ForegroundTile::STONE)
-                .unwrap();
-        }
-        let chest = world
-            .place_furniture(FurnitureObject::CHEST, TilePos::new(10, 7))
-            .unwrap();
-        assert!(
-            world
-                .container_mut(bore)
-                .unwrap()
-                .set_slot(0, ItemStack::new(ItemId::STONE_BLOCK, 6))
-        );
-        let mut system = ItemTransportSystem::default();
-
-        let update = system.update(&mut world, &registry, 1.0);
-        assert_eq!(update.transfer_count, 6);
-        assert_eq!(
-            world.container(chest).unwrap().slot(0),
-            ItemStack::new(ItemId::STONE_BLOCK, 6)
-        );
-    }
-
-    #[test]
-    fn buffer_contents_feed_an_input_machine() {
-        let registry = ItemRegistry::with_built_ins();
-        let (mut world, bore, launcher) = connected_machines();
-        assert!(world.remove_object(bore).is_some());
-        let chest = world
-            .place_furniture(FurnitureObject::CHEST, TilePos::new(3, 7))
-            .unwrap();
-        assert!(
-            world
-                .container_mut(chest)
-                .unwrap()
-                .set_slot(4, ItemStack::new(ItemId::DIRT_BLOCK, 17))
-        );
-        let mut system = ItemTransportSystem::default();
-
-        let update = system.update(&mut world, &registry, 1.0);
-        assert_eq!(update.transfer_count, 17);
-        assert!(world.container(chest).unwrap().is_empty());
-        assert_eq!(
-            world.container(launcher).unwrap().slot(0),
-            ItemStack::new(ItemId::DIRT_BLOCK, 17)
-        );
-    }
-
-    #[test]
-    fn active_drill_mines_into_a_connected_exporter_without_renderer_state() {
-        let registry = ItemRegistry::with_built_ins();
-        let (mut world, bore, launcher) = connected_machines();
-        for x in [15, 18, 19] {
-            world
-                .set_tile(x, 9, Layer::Foreground, ForegroundTile::STONE)
-                .unwrap();
-        }
-        world
-            .place_furniture(FurnitureObject::PYLON, TilePos::new(15, 7))
-            .unwrap();
-        world
-            .place_furniture(FurnitureObject::SOLAR_ARRAY, TilePos::new(18, 6))
-            .unwrap();
-        let mut power = crate::PowerSystem::new();
-        power.distribute(&mut world, 0.5, Duration::from_secs(1));
-        assert!(world.set_furniture_active(bore, true));
-        for _ in 0..3 {
-            world.update_decorations_with_power(Duration::from_secs(1), 8, &power);
-        }
-        assert_eq!(
-            world.container(bore).unwrap().slot(0),
-            ItemStack::new(ItemId::STONE_BLOCK, 1)
-        );
-
-        let mut system = ItemTransportSystem::default();
-        assert_eq!(system.update(&mut world, &registry, 1.0).transfer_count, 1);
-        assert_eq!(
-            world.container(launcher).unwrap().slot(0),
-            ItemStack::new(ItemId::STONE_BLOCK, 1)
-        );
-    }
-
-    #[test]
-    fn unrelated_object_changes_do_not_rebuild_transport_topology() {
-        let registry = ItemRegistry::with_built_ins();
-        let (mut world, _, _) = connected_machines();
-        let mut system = ItemTransportSystem::default();
-        assert!(system.update(&mut world, &registry, 0.0).topology_rebuilt);
-
-        world
-            .set_tile(20, 9, Layer::Foreground, ForegroundTile::DIRT)
-            .unwrap();
-        world
-            .place_natural_object(
-                crate::NaturalObject::GRASS,
-                TilePos::new(20, 8),
-                TilePos::new(20, 9),
-            )
-            .unwrap();
-        assert!(!system.update(&mut world, &registry, 0.0).topology_rebuilt);
-
-        world
-            .place_furniture(FurnitureObject::CARGO_CONVEYOR, TilePos::new(11, 5))
-            .unwrap();
-        assert!(system.update(&mut world, &registry, 0.0).topology_rebuilt);
-    }
-
-    #[test]
-    fn connector_shape_tracks_straights_and_corners() {
-        assert_eq!(
-            shape_from_connections(false, true, false, false),
-            ItemTransportShape::Horizontal
-        );
-        assert_eq!(
-            shape_from_connections(true, false, true, false),
-            ItemTransportShape::Vertical
-        );
-        assert_eq!(
-            shape_from_connections(true, true, false, false),
-            ItemTransportShape::NorthEast
-        );
-        assert_eq!(
-            shape_from_connections(false, true, true, false),
-            ItemTransportShape::SouthEast
-        );
-        assert_eq!(
-            shape_from_connections(false, false, true, true),
-            ItemTransportShape::SouthWest
-        );
-        assert_eq!(
-            shape_from_connections(true, false, false, true),
-            ItemTransportShape::NorthWest
-        );
-    }
-
-    #[test]
-    fn vertical_corner_network_transfers_items() {
-        let registry = ItemRegistry::with_built_ins();
-        let mut world = World::empty(16, 16, 0).unwrap();
-        for x in 2..=4 {
-            world
-                .set_tile(x, 13, Layer::Foreground, ForegroundTile::STONE)
-                .unwrap();
-        }
-        for x in 8..=10 {
-            world
-                .set_tile(x, 8, Layer::Foreground, ForegroundTile::STONE)
-                .unwrap();
-        }
-        let launcher = world
-            .place_furniture(
-                FurnitureObject::ORBITAL_EXPORT_LAUNCHER,
-                TilePos::new(2, 10),
-            )
-            .unwrap();
-        let path = [
-            TilePos::new(5, 12),
-            TilePos::new(6, 12),
-            TilePos::new(7, 12),
-            TilePos::new(7, 11),
-            TilePos::new(7, 10),
-            TilePos::new(7, 9),
-            TilePos::new(7, 8),
-            TilePos::new(7, 7),
-        ];
-        let mut connectors = Vec::new();
-        for anchor in path {
-            connectors.push(
-                world
-                    .place_furniture(FurnitureObject::CARGO_CONVEYOR, anchor)
-                    .unwrap(),
-            );
-        }
-        let chest = world
-            .place_furniture(FurnitureObject::CHEST, TilePos::new(8, 6))
-            .unwrap();
-        assert!(
-            world
-                .container_mut(chest)
-                .unwrap()
-                .set_slot(0, ItemStack::new(ItemId::STONE_BLOCK, 9))
-        );
-
-        assert_eq!(
-            item_transport_shape(&world, connectors[2]),
-            Some(ItemTransportShape::NorthWest)
-        );
-        assert_eq!(
-            item_transport_shape(&world, connectors[3]),
-            Some(ItemTransportShape::Vertical)
-        );
-
-        let mut system = ItemTransportSystem::default();
-        assert_eq!(system.update(&mut world, &registry, 1.0).transfer_count, 9);
-        assert_eq!(
-            world.container(launcher).unwrap().slot(0),
-            ItemStack::new(ItemId::STONE_BLOCK, 9)
-        );
-    }
-}
+mod tests;

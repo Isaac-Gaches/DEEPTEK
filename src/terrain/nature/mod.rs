@@ -1,6 +1,11 @@
-use super::objects::{DecorationUpdate, ObjectId, ObjectTypeId, TilePos, WorldObject};
+use super::objects::{
+    DecorationUpdate, ObjectId, ObjectTypeId, RemovedObject, TilePos, WorldObject,
+};
+// Budgeted natural growth and automated terrain interactions.
+
 use super::{
-    CHUNK_SIZE, FurnitureObject, LASER_BORE_TICKS_PER_TILE, Layer, NaturalObject, TileId, World,
+    CHUNK_SIZE, FurnitureObject, LASER_BORE_TICKS_PER_TILE, Layer, NaturalObject,
+    RED_SHAFT_BORE_WIDTH, TileId, World,
 };
 use crate::PowerSystem;
 use crate::items::mined_block_drop;
@@ -15,7 +20,7 @@ pub const MAX_VINE_LENGTH: u16 = 10;
 enum ScheduledObjectUpdate {
     Unchanged,
     Grown,
-    TileDestroyed(TilePos),
+    TilesDestroyed(Vec<super::BrokenTile>),
 }
 
 /// Bounded rates for world-object and active-area natural simulation. Scheduled
@@ -63,6 +68,14 @@ impl NatureUpdate {
     pub fn changed_tiles(&self) -> &[TilePos] {
         &self.changed_tiles
     }
+
+    pub fn detached_objects(&self) -> &[RemovedObject] {
+        self.decorations.detached_objects()
+    }
+
+    pub fn broken_tiles(&self) -> &[super::BrokenTile] {
+        self.decorations.broken_tiles()
+    }
 }
 
 impl World {
@@ -109,9 +122,15 @@ impl World {
             match self.update_scheduled_object(event.object, power) {
                 ScheduledObjectUpdate::Unchanged => {}
                 ScheduledObjectUpdate::Grown => update.objects_grown += 1,
-                ScheduledObjectUpdate::TileDestroyed(position) => {
-                    update.tiles_destroyed += 1;
-                    update.changed_tiles.push(position);
+                ScheduledObjectUpdate::TilesDestroyed(tiles) => {
+                    update.tiles_destroyed += tiles.len();
+                    for tile in tiles {
+                        update.changed_tiles.push(tile.position);
+                        update
+                            .detached_objects
+                            .extend(tile.unsupported_objects.iter().cloned());
+                        update.broken_tiles.push(tile);
+                    }
                 }
             }
         }
@@ -345,6 +364,16 @@ impl World {
             FurnitureObject::LASER_BORE => {
                 self.update_laser_bore(id, &object, power.is_some_and(|power| power.is_powered(id)))
             }
+            FurnitureObject::RED_SHAFT_BORE => self.update_red_shaft_bore(
+                id,
+                &object,
+                power.is_some_and(|power| power.is_powered(id)),
+            ),
+            FurnitureObject::LASER_DRILL => self.update_laser_drill(
+                id,
+                &object,
+                power.is_some_and(|power| power.is_powered(id)),
+            ),
             _ => {
                 self.objects.schedule(id, u64::MAX);
                 ScheduledObjectUpdate::Unchanged
@@ -371,8 +400,38 @@ impl World {
             self.objects.schedule(id, u64::MAX);
             return ScheduledObjectUpdate::Unchanged;
         };
+        self.update_single_tile_drill(id, beam.target)
+    }
+
+    fn update_laser_drill(
+        &mut self,
+        id: ObjectId,
+        object: &WorldObject,
+        powered: bool,
+    ) -> ScheduledObjectUpdate {
+        if !object.active {
+            self.objects.schedule(id, u64::MAX);
+            return ScheduledObjectUpdate::Unchanged;
+        }
+        if !powered {
+            self.objects
+                .schedule(id, self.simulation_tick.saturating_add(1));
+            return ScheduledObjectUpdate::Unchanged;
+        }
+        let Some(beam) = self.laser_drill_beam(object, powered) else {
+            self.objects.schedule(id, u64::MAX);
+            return ScheduledObjectUpdate::Unchanged;
+        };
+        self.update_single_tile_drill(id, beam.target)
+    }
+
+    fn update_single_tile_drill(
+        &mut self,
+        id: ObjectId,
+        target: Option<TilePos>,
+    ) -> ScheduledObjectUpdate {
         let next_tick = self.simulation_tick.saturating_add(1);
-        let Some(target) = beam.target else {
+        let Some(target) = target else {
             if let Some(bore) = self.objects.object_mut(id) {
                 bore.machine_target_y = u32::MAX;
                 bore.growth_stage = 0;
@@ -381,33 +440,17 @@ impl World {
             return ScheduledObjectUpdate::Unchanged;
         };
 
-        let damage = if object.machine_target_y == target.y {
-            object.growth_stage.saturating_add(1)
-        } else {
-            1
-        };
-        if damage < LASER_BORE_TICKS_PER_TILE {
-            if let Some(bore) = self.objects.object_mut(id) {
-                bore.machine_target_y = target.y;
-                bore.growth_stage = damage;
-            }
-            self.objects.schedule(id, next_tick);
-            return ScheduledObjectUpdate::Unchanged;
-        }
-
         let target_tile = self.tile_in_bounds(target.x, target.y, Layer::Foreground);
-        let drop = mined_block_drop(target_tile);
+        let drop = mined_block_drop(target_tile, Layer::Foreground);
         let can_store = drop.is_some_and(|(item, max_stack)| {
             self.objects
                 .containers
                 .get(&id)
                 .is_some_and(|container| container.can_add(item, 1, max_stack))
         });
-        let destroyed = can_store
-            && self
-                .set_tile(target.x, target.y, Layer::Foreground, TileId::EMPTY)
-                .is_ok();
-        if destroyed {
+        let drill_speed_percent = self.specialist_bonuses().drill_speed_percent();
+        let broken = apply_drill_damage(self, target, can_store, drill_speed_percent);
+        if broken.is_some() {
             let (item, max_stack) = drop.expect("storable laser-bore targets have a drop");
             let stored = self
                 .objects
@@ -417,20 +460,119 @@ impl World {
             debug_assert!(stored, "capacity was reserved before mining the tile");
         }
         if let Some(bore) = self.objects.object_mut(id) {
-            bore.machine_target_y = if destroyed { u32::MAX } else { target.y };
-            bore.growth_stage = if destroyed {
-                0
+            bore.machine_target_y = if broken.is_some() { u32::MAX } else { target.y };
+            bore.growth_stage = 0;
+        }
+        self.objects.schedule(id, next_tick);
+        broken.map_or(ScheduledObjectUpdate::Unchanged, |broken| {
+            ScheduledObjectUpdate::TilesDestroyed(vec![broken])
+        })
+    }
+
+    fn update_red_shaft_bore(
+        &mut self,
+        id: ObjectId,
+        object: &WorldObject,
+        powered: bool,
+    ) -> ScheduledObjectUpdate {
+        if !object.active {
+            self.objects.schedule(id, u64::MAX);
+            return ScheduledObjectUpdate::Unchanged;
+        }
+        let next_tick = self.simulation_tick.saturating_add(1);
+        if !powered {
+            self.objects.schedule(id, next_tick);
+            return ScheduledObjectUpdate::Unchanged;
+        }
+        let Some(beam) = self.red_shaft_bore_beam(object, powered) else {
+            self.objects.schedule(id, u64::MAX);
+            return ScheduledObjectUpdate::Unchanged;
+        };
+        let Some(target_y) = beam.target_y else {
+            if let Some(bore) = self.objects.object_mut(id) {
+                bore.machine_target_y = u32::MAX;
+                bore.growth_stage = 0;
+            }
+            self.objects.schedule(id, next_tick);
+            return ScheduledObjectUpdate::Unchanged;
+        };
+        let targets: Vec<_> = (beam.first_x..beam.first_x + RED_SHAFT_BORE_WIDTH)
+            .filter_map(|x| {
+                let tile = self.tile_in_bounds(x, target_y, Layer::Foreground);
+                mined_block_drop(tile, Layer::Foreground)
+                    .map(|drop| (TilePos::new(x, target_y), drop))
+            })
+            .collect();
+        let can_store_all =
+            self.objects
+                .containers
+                .get(&id)
+                .cloned()
+                .is_some_and(|mut container| {
+                    targets
+                        .iter()
+                        .all(|&(_, (item, max_stack))| container.try_add(item, 1, max_stack))
+                });
+        let mut destroyed = Vec::with_capacity(RED_SHAFT_BORE_WIDTH as usize);
+        let drill_speed_percent = self.specialist_bonuses().drill_speed_percent();
+        for &(target, (item, max_stack)) in &targets {
+            let Some(broken) = apply_drill_damage(self, target, can_store_all, drill_speed_percent)
+            else {
+                continue;
+            };
+            if can_store_all {
+                let stored = self
+                    .objects
+                    .containers
+                    .get_mut(&id)
+                    .is_some_and(|container| container.try_add(item, 1, max_stack));
+                debug_assert!(stored, "shaft-bore storage was reserved before mining");
+                destroyed.push(broken);
+            }
+        }
+        if let Some(bore) = self.objects.object_mut(id) {
+            bore.machine_target_y = if destroyed.is_empty() {
+                target_y
             } else {
+                u32::MAX
+            };
+            bore.growth_stage = if destroyed.is_empty() {
                 LASER_BORE_TICKS_PER_TILE
+            } else {
+                0
             };
         }
         self.objects.schedule(id, next_tick);
-        if destroyed {
-            ScheduledObjectUpdate::TileDestroyed(target)
-        } else {
+        if destroyed.is_empty() {
             ScheduledObjectUpdate::Unchanged
+        } else {
+            ScheduledObjectUpdate::TilesDestroyed(destroyed)
         }
     }
+}
+
+fn apply_drill_damage(
+    world: &mut World,
+    target: TilePos,
+    may_break: bool,
+    speed_percent: u16,
+) -> Option<super::BrokenTile> {
+    let health = world
+        .block_health(target, Layer::Foreground)
+        .ok()
+        .flatten()?;
+    let mut damage = health
+        .maximum()
+        .div_ceil(u16::from(LASER_BORE_TICKS_PER_TILE.max(1)));
+    damage = ((u32::from(damage) * u32::from(speed_percent.max(1))).div_ceil(100))
+        .min(u32::from(u16::MAX)) as u16;
+    if !may_break {
+        damage = damage.min(health.current().saturating_sub(1));
+    }
+    (damage > 0)
+        .then(|| world.damage_block(target, Layer::Foreground, damage).ok())
+        .flatten()
+        .and_then(|result| result.broken)
 }
 
 pub(super) fn make_generated_object(
@@ -452,6 +594,7 @@ pub(super) fn make_generated_object(
         variant,
         growth_stage,
         active: true,
+        health: 0,
         stored_energy_milli: 0,
         machine_target_y: u32::MAX,
         kill_count: 0,
@@ -547,444 +690,4 @@ fn nature_hash(seed: u64, tick: u64, x: u32, y: u32, salt: u64) -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{ForegroundTile, ItemId, ItemStack, ObjectPlacementError};
-
-    fn supported_world() -> World {
-        let mut world = World::empty(128, 128, 7).unwrap();
-        world
-            .set_tile(10, 11, Layer::Foreground, ForegroundTile::GRASS)
-            .unwrap();
-        world
-            .set_tile(20, 9, Layer::Foreground, ForegroundTile::GRASS)
-            .unwrap();
-        world
-    }
-
-    fn power_laser_bore(world: &mut World) -> PowerSystem {
-        for x in [9, 11, 12] {
-            world
-                .set_tile(x, 8, Layer::Foreground, ForegroundTile::STONE)
-                .unwrap();
-        }
-        world
-            .place_furniture(FurnitureObject::PYLON, TilePos::new(9, 6))
-            .unwrap();
-        world
-            .place_furniture(FurnitureObject::SOLAR_ARRAY, TilePos::new(11, 5))
-            .unwrap();
-        let mut power = PowerSystem::new();
-        power.distribute(world, 0.5, Duration::from_secs(1));
-        power
-    }
-
-    #[test]
-    fn breaking_a_root_removes_its_objects() {
-        let mut world = supported_world();
-        world
-            .place_natural_object(
-                NaturalObject::GRASS,
-                TilePos::new(10, 10),
-                TilePos::new(10, 11),
-            )
-            .unwrap();
-        assert_eq!(world.object_count(), 1);
-        world
-            .set_tile(10, 11, Layer::Foreground, TileId::EMPTY)
-            .unwrap();
-        assert_eq!(world.object_count(), 0);
-    }
-
-    #[test]
-    fn vine_grows_without_scanning_unrelated_objects() {
-        let mut world = supported_world();
-        let vine = world
-            .place_natural_object(
-                NaturalObject::VINE,
-                TilePos::new(20, 10),
-                TilePos::new(20, 9),
-            )
-            .unwrap();
-        let update = world.update_decorations(Duration::from_secs(4), 8);
-        assert_eq!(update.objects_processed, 1);
-        assert_eq!(update.objects_grown, 1);
-        assert_eq!(world.object(vine).unwrap().size(), [1, 2]);
-    }
-
-    #[test]
-    fn occupied_cells_prevent_overlapping_objects() {
-        let mut world = supported_world();
-        world
-            .place_natural_object(
-                NaturalObject::GRASS,
-                TilePos::new(10, 10),
-                TilePos::new(10, 11),
-            )
-            .unwrap();
-        assert!(matches!(
-            world.place_natural_object(
-                NaturalObject::PEBBLE,
-                TilePos::new(10, 10),
-                TilePos::new(10, 11),
-            ),
-            Err(ObjectPlacementError::Occupied(_))
-        ));
-    }
-
-    #[test]
-    fn nature_ticks_spawn_valid_plants_and_spread_exposed_grass() {
-        let mut world = World::empty(8, 8, 19).unwrap();
-        world
-            .set_tile(2, 4, Layer::Foreground, ForegroundTile::GRASS)
-            .unwrap();
-        world
-            .set_tile(4, 2, Layer::Foreground, ForegroundTile::GRASS)
-            .unwrap();
-        world
-            .set_tile(5, 4, Layer::Foreground, ForegroundTile::GRASS)
-            .unwrap();
-        world
-            .set_tile(6, 4, Layer::Foreground, ForegroundTile::DIRT)
-            .unwrap();
-        let config = NatureSimulationConfig {
-            horizontal_radius_tiles: 8,
-            vertical_radius_tiles: 8,
-            columns_per_tick: 8,
-            max_columns_per_update: 8,
-            object_update_budget: 8,
-            grass_spawn_chance: 1,
-            vine_spawn_chance: 1,
-            grass_spread_chance: 1,
-        };
-
-        let early = world.update_nature(Duration::from_millis(999), TilePos::new(4, 4), config);
-        assert_eq!(early.columns_scanned, 0);
-        let update = world.update_nature(Duration::from_millis(1), TilePos::new(4, 4), config);
-
-        assert!(update.grass_spawned >= 1);
-        assert!(update.vines_spawned >= 1);
-        assert_eq!(update.grass_tiles_spread, 1);
-        assert_eq!(update.changed_tiles(), &[TilePos::new(6, 4)]);
-        assert_eq!(
-            world.tile(6, 4, Layer::Foreground).unwrap(),
-            ForegroundTile::GRASS
-        );
-        assert!(world.objects().any(|object| {
-            object.object_type() == NaturalObject::GRASS && object.anchor() == TilePos::new(2, 3)
-        }));
-        assert!(world.objects().any(|object| {
-            object.object_type() == NaturalObject::VINE && object.anchor() == TilePos::new(4, 3)
-        }));
-    }
-
-    #[test]
-    fn nature_work_is_capped_after_a_long_frame() {
-        let mut world = World::empty(128, 64, 3).unwrap();
-        let config = NatureSimulationConfig {
-            horizontal_radius_tiles: 128,
-            vertical_radius_tiles: 64,
-            columns_per_tick: 16,
-            max_columns_per_update: 3,
-            ..NatureSimulationConfig::default()
-        };
-        let update = world.update_nature(Duration::from_secs(30), TilePos::new(64, 32), config);
-        assert_eq!(update.columns_scanned, 3);
-    }
-
-    #[test]
-    fn laser_bore_destroys_one_target_after_three_scheduled_ticks() {
-        let mut world = World::empty(16, 80, 0).unwrap();
-        for x in [4, 6] {
-            world
-                .set_tile(x, 8, Layer::Foreground, ForegroundTile::STONE)
-                .unwrap();
-        }
-        world
-            .set_tile(5, 12, Layer::Foreground, ForegroundTile::STONE)
-            .unwrap();
-        let bore = world
-            .place_furniture(FurnitureObject::LASER_BORE, TilePos::new(4, 5))
-            .unwrap();
-        assert!(world.set_furniture_active(bore, true));
-        let power = power_laser_bore(&mut world);
-
-        let beam = world
-            .laser_bore_beam(world.object(bore).unwrap(), power.is_powered(bore))
-            .unwrap();
-        assert_eq!(beam.length_tiles, 4);
-        assert_eq!(beam.target, Some(TilePos::new(5, 12)));
-
-        for _ in 0..2 {
-            let update = world.update_decorations_with_power(Duration::from_secs(1), 8, &power);
-            assert_eq!(update.tiles_destroyed, 0);
-            assert_eq!(
-                world.tile(5, 12, Layer::Foreground).unwrap(),
-                ForegroundTile::STONE
-            );
-        }
-        let update = world.update_decorations_with_power(Duration::from_secs(1), 8, &power);
-        assert_eq!(update.tiles_destroyed, 1);
-        assert_eq!(update.changed_tiles(), &[TilePos::new(5, 12)]);
-        assert_eq!(world.tile(5, 12, Layer::Foreground).unwrap(), TileId::EMPTY);
-        assert_eq!(
-            world.container(bore).unwrap().slot(0),
-            ItemStack::new(ItemId::STONE_BLOCK, 1)
-        );
-        assert!(world.object(bore).is_some());
-    }
-
-    #[test]
-    fn laser_bore_stays_idle_until_activated_and_stops_when_deactivated() {
-        let mut world = World::empty(16, 80, 0).unwrap();
-        for x in [4, 6] {
-            world
-                .set_tile(x, 8, Layer::Foreground, ForegroundTile::STONE)
-                .unwrap();
-        }
-        world
-            .set_tile(5, 12, Layer::Foreground, ForegroundTile::STONE)
-            .unwrap();
-        let bore = world
-            .place_furniture(FurnitureObject::LASER_BORE, TilePos::new(4, 5))
-            .unwrap();
-        let power = power_laser_bore(&mut world);
-
-        assert!(!world.object(bore).unwrap().is_active());
-        assert!(
-            world
-                .laser_bore_beam(world.object(bore).unwrap(), power.is_powered(bore))
-                .is_none()
-        );
-        let idle = world.update_decorations(Duration::from_secs(10), 8);
-        assert_eq!(idle.objects_processed, 0);
-
-        assert!(world.set_furniture_active(bore, true));
-        world.update_decorations_with_power(Duration::from_secs(1), 8, &power);
-        assert!(world.set_furniture_active(bore, false));
-        let stopped = world.update_decorations(Duration::from_secs(10), 8);
-        assert_eq!(stopped.tiles_destroyed, 0);
-        assert_eq!(
-            world.tile(5, 12, Layer::Foreground).unwrap(),
-            ForegroundTile::STONE
-        );
-    }
-
-    #[test]
-    fn active_laser_bore_pauses_until_its_grid_is_energized() {
-        let mut world = World::empty(16, 80, 0).unwrap();
-        for x in [4, 6] {
-            world
-                .set_tile(x, 8, Layer::Foreground, ForegroundTile::STONE)
-                .unwrap();
-        }
-        world
-            .set_tile(5, 12, Layer::Foreground, ForegroundTile::STONE)
-            .unwrap();
-        let bore = world
-            .place_furniture(FurnitureObject::LASER_BORE, TilePos::new(4, 5))
-            .unwrap();
-        assert!(world.set_furniture_active(bore, true));
-        let mut power = PowerSystem::new();
-        power.update(&world);
-
-        for _ in 0..4 {
-            world.update_decorations_with_power(Duration::from_secs(1), 8, &power);
-        }
-        assert_eq!(
-            world.tile(5, 12, Layer::Foreground).unwrap(),
-            ForegroundTile::STONE
-        );
-        assert_eq!(world.object(bore).unwrap().growth_stage(), 0);
-
-        power = power_laser_bore(&mut world);
-        assert!(power.is_powered(bore));
-        for _ in 0..3 {
-            world.update_decorations_with_power(Duration::from_secs(1), 8, &power);
-        }
-        assert_eq!(world.tile(5, 12, Layer::Foreground).unwrap(), TileId::EMPTY);
-    }
-
-    #[test]
-    fn laser_bore_pauses_without_destroying_a_block_when_storage_is_full() {
-        let mut world = World::empty(16, 80, 0).unwrap();
-        for x in [4, 6] {
-            world
-                .set_tile(x, 8, Layer::Foreground, ForegroundTile::STONE)
-                .unwrap();
-        }
-        world
-            .set_tile(5, 12, Layer::Foreground, ForegroundTile::STONE)
-            .unwrap();
-        let bore = world
-            .place_furniture(FurnitureObject::LASER_BORE, TilePos::new(4, 5))
-            .unwrap();
-        assert!(world.set_furniture_active(bore, true));
-        let power = power_laser_bore(&mut world);
-        for slot in 0..usize::from(crate::LASER_BORE_SLOTS) {
-            assert!(
-                world
-                    .container_mut(bore)
-                    .unwrap()
-                    .set_slot(slot, ItemStack::new(ItemId::DIRT_BLOCK, 999),)
-            );
-        }
-
-        for _ in 0..4 {
-            world.update_decorations_with_power(Duration::from_secs(1), 8, &power);
-        }
-        assert_eq!(
-            world.tile(5, 12, Layer::Foreground).unwrap(),
-            ForegroundTile::STONE
-        );
-
-        assert!(world.container_mut(bore).unwrap().set_slot(0, None));
-        let update = world.update_decorations_with_power(Duration::from_secs(1), 8, &power);
-        assert_eq!(update.tiles_destroyed, 1);
-        assert_eq!(world.tile(5, 12, Layer::Foreground).unwrap(), TileId::EMPTY);
-        assert_eq!(
-            world.container(bore).unwrap().slot(0),
-            ItemStack::new(ItemId::STONE_BLOCK, 1)
-        );
-    }
-
-    #[test]
-    fn laser_bore_mines_outside_the_players_active_area() {
-        let mut world = World::empty(512, 80, 0).unwrap();
-        for x in [4, 6] {
-            world
-                .set_tile(x, 8, Layer::Foreground, ForegroundTile::STONE)
-                .unwrap();
-        }
-        world
-            .set_tile(5, 12, Layer::Foreground, ForegroundTile::STONE)
-            .unwrap();
-        let bore = world
-            .place_furniture(FurnitureObject::LASER_BORE, TilePos::new(4, 5))
-            .unwrap();
-        assert!(world.set_furniture_active(bore, true));
-        let power = power_laser_bore(&mut world);
-        let config = NatureSimulationConfig {
-            horizontal_radius_tiles: 0,
-            vertical_radius_tiles: 0,
-            columns_per_tick: 1,
-            max_columns_per_update: 1,
-            object_update_budget: 1,
-            ..NatureSimulationConfig::default()
-        };
-        let player = TilePos::new(500, 70);
-
-        for _ in 0..2 {
-            let update =
-                world.update_nature_with_power(Duration::from_secs(1), player, config, &power);
-            assert_eq!(update.decorations.objects_processed, 1);
-            assert_eq!(update.decorations.tiles_destroyed, 0);
-            assert_eq!(update.columns_scanned, 1);
-        }
-        let update = world.update_nature_with_power(Duration::from_secs(1), player, config, &power);
-        assert_eq!(update.decorations.objects_processed, 1);
-        assert_eq!(update.decorations.tiles_destroyed, 1);
-        assert_eq!(update.changed_tiles(), &[TilePos::new(5, 12)]);
-        assert_eq!(world.tile(5, 12, Layer::Foreground).unwrap(), TileId::EMPTY);
-    }
-
-    #[test]
-    fn laser_bore_never_scans_beyond_four_hundred_tiles() {
-        let mut world = World::empty(8, 500, 0).unwrap();
-        for x in [2, 4] {
-            world
-                .set_tile(x, 6, Layer::Foreground, ForegroundTile::STONE)
-                .unwrap();
-        }
-        world
-            .set_tile(3, 406, Layer::Foreground, ForegroundTile::STONE)
-            .unwrap();
-        let bore = world
-            .place_furniture(FurnitureObject::LASER_BORE, TilePos::new(2, 3))
-            .unwrap();
-        assert!(world.set_furniture_active(bore, true));
-
-        let beam = world
-            .laser_bore_beam(world.object(bore).unwrap(), true)
-            .unwrap();
-        assert_eq!(beam.first_y, 6);
-        assert_eq!(beam.length_tiles, 400);
-        assert_eq!(beam.target, None);
-        for _ in 0..4 {
-            world.update_decorations(Duration::from_secs(1), 8);
-        }
-        assert_eq!(
-            world.tile(3, 406, Layer::Foreground).unwrap(),
-            ForegroundTile::STONE
-        );
-    }
-
-    #[test]
-    fn laser_bore_tracks_and_mines_targets_beyond_u8_range() {
-        let mut world = World::empty(16, 450, 0).unwrap();
-        for x in [2, 4, 6, 8, 9] {
-            world
-                .set_tile(x, 6, Layer::Foreground, ForegroundTile::STONE)
-                .unwrap();
-        }
-        world
-            .set_tile(3, 306, Layer::Foreground, ForegroundTile::STONE)
-            .unwrap();
-        let bore = world
-            .place_furniture(FurnitureObject::LASER_BORE, TilePos::new(2, 3))
-            .unwrap();
-        world
-            .place_furniture(FurnitureObject::PYLON, TilePos::new(6, 4))
-            .unwrap();
-        world
-            .place_furniture(FurnitureObject::SOLAR_ARRAY, TilePos::new(8, 3))
-            .unwrap();
-        assert!(world.set_furniture_active(bore, true));
-        let mut power = PowerSystem::new();
-        power.distribute(&mut world, 0.5, Duration::from_secs(1));
-
-        for _ in 0..3 {
-            world.update_decorations_with_power(Duration::from_secs(1), 8, &power);
-        }
-        assert_eq!(
-            world.tile(3, 306, Layer::Foreground).unwrap(),
-            TileId::EMPTY
-        );
-    }
-
-    #[test]
-    fn dirt_becoming_grass_keeps_generic_surface_decorations() {
-        let mut world = World::empty(8, 8, 0).unwrap();
-        world
-            .set_tile(2, 3, Layer::Foreground, ForegroundTile::DIRT)
-            .unwrap();
-        let pebble = world
-            .place_natural_object(
-                NaturalObject::PEBBLE,
-                TilePos::new(2, 2),
-                TilePos::new(2, 3),
-            )
-            .unwrap();
-        world
-            .set_tile(2, 3, Layer::Foreground, ForegroundTile::GRASS)
-            .unwrap();
-        assert!(world.object(pebble).is_some());
-    }
-
-    #[test]
-    fn decoration_revision_tracks_placement_and_growth() {
-        let mut world = supported_world();
-        let initial = world.object_revision();
-        world
-            .place_natural_object(
-                NaturalObject::VINE,
-                TilePos::new(20, 10),
-                TilePos::new(20, 9),
-            )
-            .unwrap();
-        let placed = world.object_revision();
-        assert_ne!(placed, initial);
-        world.update_decorations(Duration::from_secs(4), 8);
-        assert_ne!(world.object_revision(), placed);
-    }
-}
+mod tests;

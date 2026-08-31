@@ -3,17 +3,56 @@ use deep_tek::GuiRenderer;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PauseMenuAction {
     Resume,
+    Settings,
+    Back,
+    SetRenderDistance(RenderDistance),
     SaveAndMainMenu,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum RenderDistance {
+    Low,
+    #[default]
+    Medium,
+    High,
+}
+
+impl RenderDistance {
+    pub(crate) const fn chunk_radii(self) -> (u32, u32) {
+        match self {
+            Self::Low => (1, 1),
+            Self::Medium => (2, 1),
+            Self::High => (3, 2),
+        }
+    }
+
+    pub(crate) const fn maximum_zoom(self) -> f32 {
+        match self {
+            Self::Low => 60.0,
+            Self::Medium => 90.0,
+            Self::High => 120.0,
+        }
+    }
 }
 
 #[derive(Default)]
 pub(crate) struct PauseMenu {
     error: Option<&'static str>,
+    settings_open: bool,
 }
 
 impl PauseMenu {
+    pub(crate) fn show_settings(&mut self) {
+        self.settings_open = true;
+    }
+
+    pub(crate) fn show_root(&mut self) {
+        self.settings_open = false;
+    }
+
     pub(crate) fn clear_error(&mut self) {
         self.error = None;
+        self.settings_open = false;
     }
 
     pub(crate) fn set_save_failed(&mut self) {
@@ -26,8 +65,22 @@ impl PauseMenu {
         viewport: [f32; 2],
     ) -> Option<PauseMenuAction> {
         let layout = PauseLayout::new(viewport);
-        if layout.resume.contains(cursor) {
+        if self.settings_open {
+            if layout.low.contains(cursor) {
+                Some(PauseMenuAction::SetRenderDistance(RenderDistance::Low))
+            } else if layout.medium.contains(cursor) {
+                Some(PauseMenuAction::SetRenderDistance(RenderDistance::Medium))
+            } else if layout.high.contains(cursor) {
+                Some(PauseMenuAction::SetRenderDistance(RenderDistance::High))
+            } else if layout.back.contains(cursor) {
+                Some(PauseMenuAction::Back)
+            } else {
+                None
+            }
+        } else if layout.resume.contains(cursor) {
             Some(PauseMenuAction::Resume)
+        } else if layout.settings.contains(cursor) {
+            Some(PauseMenuAction::Settings)
         } else if layout.save_and_menu.contains(cursor) {
             Some(PauseMenuAction::SaveAndMainMenu)
         } else {
@@ -35,7 +88,13 @@ impl PauseMenu {
         }
     }
 
-    pub(crate) fn queue(&self, renderer: &mut GuiRenderer, viewport: [f32; 2], cursor: [f32; 2]) {
+    pub(crate) fn queue(
+        &self,
+        renderer: &mut GuiRenderer,
+        viewport: [f32; 2],
+        cursor: [f32; 2],
+        render_distance: RenderDistance,
+    ) {
         let layout = PauseLayout::new(viewport);
         renderer.queue_rect(
             [viewport[0] * 0.5, viewport[1] * 0.5],
@@ -49,18 +108,64 @@ impl PauseMenu {
         );
         queue_centred_text(
             renderer,
-            "PAUSED",
+            if self.settings_open {
+                "SETTINGS"
+            } else {
+                "PAUSED"
+            },
             layout.panel.centre[0],
             layout.panel.top() + 38.0,
             4.0,
             [0.80, 0.90, 1.0, 1.0],
         );
+        if self.settings_open {
+            queue_centred_text(
+                renderer,
+                "RENDER DISTANCE",
+                layout.panel.centre[0],
+                layout.panel.top() + 92.0,
+                2.0,
+                [0.65, 0.78, 0.88, 1.0],
+            );
+            for (button, label, value) in [
+                (layout.low, "LOW", RenderDistance::Low),
+                (layout.medium, "MEDIUM", RenderDistance::Medium),
+                (layout.high, "HIGH", RenderDistance::High),
+            ] {
+                queue_button(
+                    renderer,
+                    button,
+                    cursor,
+                    label,
+                    if value == render_distance {
+                        [0.16, 0.55, 0.34, 1.0]
+                    } else {
+                        [0.10, 0.24, 0.36, 1.0]
+                    },
+                );
+            }
+            queue_button(
+                renderer,
+                layout.back,
+                cursor,
+                "BACK",
+                [0.24, 0.29, 0.36, 1.0],
+            );
+            return;
+        }
         queue_button(
             renderer,
             layout.resume,
             cursor,
             "RESUME",
             [0.12, 0.34, 0.52, 1.0],
+        );
+        queue_button(
+            renderer,
+            layout.settings,
+            cursor,
+            "SETTINGS",
+            [0.16, 0.27, 0.42, 1.0],
         );
         queue_button(
             renderer,
@@ -86,7 +191,12 @@ impl PauseMenu {
 struct PauseLayout {
     panel: Rect,
     resume: Rect,
+    settings: Rect,
     save_and_menu: Rect,
+    low: Rect,
+    medium: Rect,
+    high: Rect,
+    back: Rect,
 }
 
 impl PauseLayout {
@@ -99,11 +209,31 @@ impl PauseLayout {
         Self {
             panel,
             resume: Rect {
-                centre: [panel.centre[0], panel.centre[1] - 35.0],
+                centre: [panel.centre[0], panel.centre[1] - 65.0],
+                size: button_size,
+            },
+            settings: Rect {
+                centre: [panel.centre[0], panel.centre[1] + 5.0],
                 size: button_size,
             },
             save_and_menu: Rect {
-                centre: [panel.centre[0], panel.centre[1] + 45.0],
+                centre: [panel.centre[0], panel.centre[1] + 75.0],
+                size: button_size,
+            },
+            low: Rect {
+                centre: [panel.centre[0] - 150.0, panel.centre[1]],
+                size: [120.0, 54.0],
+            },
+            medium: Rect {
+                centre: [panel.centre[0], panel.centre[1]],
+                size: [140.0, 54.0],
+            },
+            high: Rect {
+                centre: [panel.centre[0] + 150.0, panel.centre[1]],
+                size: [120.0, 54.0],
+            },
+            back: Rect {
+                centre: [panel.centre[0], panel.centre[1] + 92.0],
                 size: button_size,
             },
         }
@@ -193,6 +323,26 @@ mod tests {
             menu.handle_click(layout.save_and_menu.centre, viewport),
             Some(PauseMenuAction::SaveAndMainMenu)
         );
+        assert_eq!(
+            menu.handle_click(layout.settings.centre, viewport),
+            Some(PauseMenuAction::Settings)
+        );
         assert_eq!(menu.handle_click([0.0, 0.0], viewport), None);
+    }
+
+    #[test]
+    fn settings_select_render_distance_and_can_go_back() {
+        let mut menu = PauseMenu::default();
+        let viewport = [800.0, 600.0];
+        let layout = PauseLayout::new(viewport);
+        menu.show_settings();
+        assert_eq!(
+            menu.handle_click(layout.high.centre, viewport),
+            Some(PauseMenuAction::SetRenderDistance(RenderDistance::High))
+        );
+        assert_eq!(
+            menu.handle_click(layout.back.centre, viewport),
+            Some(PauseMenuAction::Back)
+        );
     }
 }

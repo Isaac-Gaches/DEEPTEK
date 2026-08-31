@@ -9,8 +9,8 @@ use easy_gpu::frame::Frame;
 use easy_gpu::wgpu::{Extent3d, FilterMode, TextureFormat, TextureUsages};
 
 const DIFFUSION_ITERATIONS: usize = 12;
-const TILE_SMOOTH_ITERATIONS: usize = 2;
-const UPSCALED_SMOOTH_ITERATIONS: usize = 2;
+const TILE_SMOOTH_ITERATIONS: usize = 1;
+const UPSCALED_SMOOTH_ITERATIONS: usize = 1;
 const MAX_LIGHTS: usize = 8_192;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

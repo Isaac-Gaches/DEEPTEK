@@ -33,6 +33,7 @@ impl World {
             variant: CargoLiftDirection::Idle as u8,
             growth_stage: 0,
             active: true,
+            health: definition.maximum_health().unwrap_or(0),
             stored_energy_milli: 0,
             machine_target_y: u32::MAX,
             kill_count: 0,
@@ -133,7 +134,7 @@ impl World {
         let Some(snapshot) = self.objects.object(lift) else {
             return false;
         };
-        if snapshot.object_type != FurnitureObject::CARGO_LIFT {
+        if snapshot.object_type != FurnitureObject::CARGO_LIFT || !snapshot.is_active() {
             return false;
         }
         let Some(cable) = snapshot
@@ -173,9 +174,17 @@ impl World {
         power: &PowerSystem,
         registry: &ItemRegistry,
     ) -> usize {
-        let distance = (u128::from(CARGO_LIFT_SPEED_MILLI_TILES_PER_SECOND) * elapsed.as_nanos()
-            / 1_000_000_000)
-            .min(u128::from(u32::MAX)) as u32;
+        self.update_cargo_lifts_with_speed(elapsed, power, registry, 100)
+    }
+
+    pub fn update_cargo_lifts_with_speed(
+        &mut self,
+        elapsed: Duration,
+        power: &PowerSystem,
+        registry: &ItemRegistry,
+        speed_percent: u16,
+    ) -> usize {
+        let distance = cargo_lift_distance(elapsed, speed_percent);
         let lifts = self
             .objects
             .ids_of_type(FurnitureObject::CARGO_LIFT)
@@ -185,6 +194,9 @@ impl World {
             let Some(lift) = self.objects.object(lift_id).cloned() else {
                 continue;
             };
+            if !lift.is_active() {
+                continue;
+            }
             let Some(direction) = CargoLiftDirection::from_raw(lift.variant) else {
                 continue;
             };
@@ -299,6 +311,13 @@ impl World {
         station: ObjectId,
         registry: &ItemRegistry,
     ) -> bool {
+        if self
+            .objects
+            .object(station)
+            .is_none_or(|station| !station.is_active())
+        {
+            return false;
+        }
         let Some(configuration) = self.lift_station_configuration(station) else {
             return false;
         };
@@ -449,4 +468,25 @@ impl World {
 fn cargo_lift_bounds(cable: &WorldObject) -> Option<(u32, u32)> {
     (cable.object_type == POWERED_CABLE_OBJECT && cable.height >= 2)
         .then(|| (cable.anchor.y, cable.anchor.y + u32::from(cable.height) - 2))
+}
+
+fn cargo_lift_distance(elapsed: Duration, speed_percent: u16) -> u32 {
+    (u128::from(CARGO_LIFT_SPEED_MILLI_TILES_PER_SECOND)
+        * u128::from(speed_percent.max(1))
+        * elapsed.as_nanos()
+        / 100
+        / 1_000_000_000)
+        .min(u128::from(u32::MAX)) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logistics_bonus_scales_lift_distance() {
+        let elapsed = Duration::from_millis(100);
+        assert_eq!(cargo_lift_distance(elapsed, 100), 600);
+        assert_eq!(cargo_lift_distance(elapsed, 125), 750);
+    }
 }

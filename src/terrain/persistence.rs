@@ -1,11 +1,21 @@
+mod objects;
+
 use super::{
-    CHUNK_AREA, CHUNK_SIZE, FurnitureConfiguration, FurnitureObject, FurnitureSupport,
-    LiftStationConfiguration, MAX_WORLD_NAME_BYTES, ObjectId, ObjectTypeId, TargetPriority, TileId,
-    TilePos, World, WorldError, WorldObject, furniture_definition, objects::ObjectStore,
-    parallel_mut,
+    BiomeId, CHUNK_AREA, CHUNK_SIZE, FurnitureConfiguration, FurnitureObject, FurnitureSupport,
+    LaserDrillAim, Layer, LiftStationConfiguration, MAX_WORLD_NAME_BYTES, ObjectId, ObjectTypeId,
+    TargetPriority, TileId, TilePos, World, WorldError, WorldObject, configuration_variant,
+    furniture_definition, objects::ObjectStore, parallel_mut,
 };
-use crate::items::{ItemContainer, ItemId, ItemStack};
-use std::collections::{HashMap, HashSet};
+use crate::contracts::SavedContractObjective;
+use crate::items::{HOTBAR_SLOTS, INVENTORY_SLOTS, Inventory, ItemContainer, ItemId, ItemStack};
+use crate::tutorial::SavedProspectorProgress;
+use crate::{
+    BUILT_IN_SPECIALISTS, Contract, ContractBoard, ContractCompany, ContractId,
+    CorporationProgress, DeliverySystem, SpecialistId, Transmission, TransmissionLog,
+    TutorialProgram, specialist_definition,
+};
+use objects::{decode_objects, encode_objects};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::ops::Range;
@@ -13,7 +23,16 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAGIC: &[u8; 8] = b"DTKWLD\0\0";
-const VERSION: u16 = 11;
+const VERSION: u16 = 19;
+const PROSPECTOR_PROGRESS_VERSION: u16 = 19;
+const MISSION_STATE_VERSION: u16 = 18;
+const BIOMES_VERSION: u16 = 17;
+const BLOCK_DURABILITY_VERSION: u16 = 16;
+const SPECIALISTS_VERSION: u16 = 15;
+const CORPORATION_PROGRESS_VERSION: u16 = 14;
+const PLAYER_STATE_VERSION: u16 = 13;
+const MACHINE_HEALTH_VERSION: u16 = 12;
+const LIFT_STATION_VERSION: u16 = 11;
 const MOTION_VERSION: u16 = 10;
 const STATISTICS_VERSION: u16 = 9;
 const BATTERY_STORAGE_VERSION: u16 = 8;
@@ -26,13 +45,22 @@ const OBJECTS_VERSION: u16 = 2;
 const LEGACY_VERSION: u16 = 1;
 const HEADER_SIZE: usize = 36;
 const SESSION_METADATA_SIZE: usize = 16;
+const LEGACY_PLAYER_STATE_SIZE: usize = 16 + INVENTORY_SLOTS * CONTAINER_SLOT_SIZE;
+const CORPORATION_PROGRESS_SIZE: usize = ContractCompany::ALL.len() * 4;
+const PLAYER_STATE_SIZE: usize = LEGACY_PLAYER_STATE_SIZE + CORPORATION_PROGRESS_SIZE;
+const MAX_PLAYER_STATE_PAYLOAD_SIZE: usize = 16 * 1024 * 1024;
+const MAX_CONTRACTS_PER_BOARD_LIST: usize = 4_096;
+const MAX_CONTRACT_REQUIREMENT_BYTES: usize = 4_096;
+const MAX_TRANSMISSIONS: usize = 4_096;
+const MAX_TRANSMISSION_TEXT_BYTES: usize = 64 * 1024;
 const RECORD_SIZE: usize = 16;
 const OBJECT_HEADER_SIZE: usize = 32;
 const LEGACY_OBJECT_RECORD_SIZE: usize = 40;
 const ACTIVATION_OBJECT_RECORD_SIZE: usize = 41;
 const BATTERY_OBJECT_RECORD_SIZE: usize = 49;
 const STATISTICS_OBJECT_RECORD_SIZE: usize = 53;
-const OBJECT_RECORD_SIZE: usize = 65;
+const MOTION_OBJECT_RECORD_SIZE: usize = 65;
+const OBJECT_RECORD_SIZE: usize = 67;
 const CONTAINER_HEADER_SIZE: usize = 12;
 const CONTAINER_SLOT_SIZE: usize = 4;
 
@@ -67,6 +95,9 @@ pub(super) fn save(world: &World, path: &Path, threads: usize) -> Result<(), Wor
         output.background = encode_layer(&world.chunks[index].background);
     })?;
     let object_payload = encode_objects(world);
+    let specialist_payload = encode_specialists(world)?;
+    let block_damage_payload = encode_block_damage(world)?;
+    let biome_payload = encode_biomes(world);
 
     let temporary = sibling_path(path, "tmp");
     let result = (|| {
@@ -88,6 +119,7 @@ pub(super) fn save(world: &World, path: &Path, threads: usize) -> Result<(), Wor
         } else {
             file.write_all(&[0; 12])?;
         }
+        write_player_state(&mut file, world.player_state())?;
         for chunk in &encoded {
             file.write_all(&(chunk.foreground.len() as u32).to_le_bytes())?;
             file.write_all(&(chunk.background.len() as u32).to_le_bytes())?;
@@ -99,6 +131,15 @@ pub(super) fn save(world: &World, path: &Path, threads: usize) -> Result<(), Wor
         file.write_all(&(object_payload.len() as u32).to_le_bytes())?;
         file.write_all(&checksum(&object_payload).to_le_bytes())?;
         file.write_all(&object_payload)?;
+        file.write_all(&(specialist_payload.len() as u32).to_le_bytes())?;
+        file.write_all(&checksum(&specialist_payload).to_le_bytes())?;
+        file.write_all(&specialist_payload)?;
+        file.write_all(&(block_damage_payload.len() as u32).to_le_bytes())?;
+        file.write_all(&checksum(&block_damage_payload).to_le_bytes())?;
+        file.write_all(&block_damage_payload)?;
+        file.write_all(&(biome_payload.len() as u32).to_le_bytes())?;
+        file.write_all(&checksum(&biome_payload).to_le_bytes())?;
+        file.write_all(&biome_payload)?;
         file.flush()?;
         file.sync_all()?;
         drop(file);
@@ -155,6 +196,14 @@ pub(super) fn load(path: &Path, threads: usize) -> Result<World, WorldError> {
             | BATTERY_STORAGE_VERSION
             | STATISTICS_VERSION
             | MOTION_VERSION
+            | LIFT_STATION_VERSION
+            | MACHINE_HEALTH_VERSION
+            | PLAYER_STATE_VERSION
+            | CORPORATION_PROGRESS_VERSION
+            | SPECIALISTS_VERSION
+            | BLOCK_DURABILITY_VERSION
+            | BIOMES_VERSION
+            | MISSION_STATE_VERSION
             | VERSION
     ) {
         return invalid(format!("unsupported version {version}"));
@@ -193,11 +242,39 @@ pub(super) fn load(path: &Path, threads: usize) -> Result<World, WorldError> {
     } else {
         None
     };
+    let player_state = if version >= MISSION_STATE_VERSION {
+        let size = read_u32(&bytes, &mut cursor)? as usize;
+        if size > MAX_PLAYER_STATE_PAYLOAD_SIZE {
+            return invalid("player state exceeds its maximum encoded size");
+        }
+        Some(read_player_state(
+            take(&bytes, &mut cursor, size)?,
+            true,
+            Some(version),
+        )?)
+    } else if version >= PLAYER_STATE_VERSION {
+        let has_corporation_progress = version >= CORPORATION_PROGRESS_VERSION;
+        let size = if has_corporation_progress {
+            PLAYER_STATE_SIZE
+        } else {
+            LEGACY_PLAYER_STATE_SIZE
+        };
+        Some(read_player_state(
+            take(&bytes, &mut cursor, size)?,
+            has_corporation_progress,
+            None,
+        )?)
+    } else {
+        None
+    };
     let mut world = World::empty(width, height, seed)?;
     world.name = name;
     if let Some((time_of_day, player_position)) = session {
         world.set_time_of_day(time_of_day)?;
         world.set_player_position(player_position)?;
+    }
+    if let Some(player_state) = player_state {
+        world.set_player_state(player_state);
     }
     if chunk_count != world.chunks.len() {
         return invalid("chunk count does not match world dimensions");
@@ -245,6 +322,39 @@ pub(super) fn load(path: &Path, threads: usize) -> Result<World, WorldError> {
     } else {
         None
     };
+    let specialist_payload = if version >= SPECIALISTS_VERSION {
+        let payload_len = read_u32(&bytes, &mut cursor)? as usize;
+        let expected_checksum = read_u32(&bytes, &mut cursor)?;
+        let payload = take(&bytes, &mut cursor, payload_len)?;
+        if checksum(payload) != expected_checksum {
+            return invalid("specialist section checksum mismatch");
+        }
+        Some(payload)
+    } else {
+        None
+    };
+    let block_damage_payload = if version >= BLOCK_DURABILITY_VERSION {
+        let payload_len = read_u32(&bytes, &mut cursor)? as usize;
+        let expected_checksum = read_u32(&bytes, &mut cursor)?;
+        let payload = take(&bytes, &mut cursor, payload_len)?;
+        if checksum(payload) != expected_checksum {
+            return invalid("block durability section checksum mismatch");
+        }
+        Some(payload)
+    } else {
+        None
+    };
+    let biome_payload = if version >= BIOMES_VERSION {
+        let payload_len = read_u32(&bytes, &mut cursor)? as usize;
+        let expected_checksum = read_u32(&bytes, &mut cursor)?;
+        let payload = take(&bytes, &mut cursor, payload_len)?;
+        if checksum(payload) != expected_checksum {
+            return invalid("biome section checksum mismatch");
+        }
+        Some(payload)
+    } else {
+        None
+    };
     if cursor != bytes.len() {
         return invalid("unexpected trailing data");
     }
@@ -272,7 +382,45 @@ pub(super) fn load(path: &Path, threads: usize) -> Result<World, WorldError> {
     if let Some(payload) = object_payload {
         decode_objects(&mut world, payload, version)?;
     }
+    if let Some(payload) = specialist_payload {
+        decode_specialists(&mut world, payload)?;
+    }
+    if let Some(payload) = block_damage_payload {
+        decode_block_damage(&mut world, payload)?;
+    }
+    if let Some(payload) = biome_payload {
+        decode_biomes(&mut world, payload)?;
+    } else {
+        world.generate_biomes();
+    }
     Ok(world)
+}
+
+fn encode_biomes(world: &World) -> Vec<u8> {
+    world
+        .biome_map()
+        .cells()
+        .iter()
+        .map(|biome| biome.raw())
+        .collect()
+}
+
+fn decode_biomes(world: &mut World, bytes: &[u8]) -> Result<(), WorldError> {
+    if bytes.len() != world.biome_map().cells().len() {
+        return invalid("biome map size does not match world dimensions");
+    }
+    let mut cells = Vec::with_capacity(bytes.len());
+    for &raw in bytes {
+        let biome = BiomeId::new(raw);
+        if !biome.is_known() {
+            return invalid("biome map contains an unknown biome ID");
+        }
+        cells.push(biome);
+    }
+    if !world.biomes.replace_cells(cells.into_boxed_slice()) {
+        return invalid("biome map size does not match world dimensions");
+    }
+    Ok(())
 }
 
 pub(super) fn read_name(path: &Path) -> Result<Option<String>, WorldError> {
@@ -296,6 +444,13 @@ pub(super) fn read_name(path: &Path) -> Result<Option<String>, WorldError> {
             | BATTERY_STORAGE_VERSION
             | STATISTICS_VERSION
             | MOTION_VERSION
+            | LIFT_STATION_VERSION
+            | MACHINE_HEALTH_VERSION
+            | PLAYER_STATE_VERSION
+            | CORPORATION_PROGRESS_VERSION
+            | SPECIALISTS_VERSION
+            | BLOCK_DURABILITY_VERSION
+            | BIOMES_VERSION
             | VERSION
     ) {
         return invalid(format!("unsupported version {version}"));
@@ -320,6 +475,530 @@ pub(super) fn read_name(path: &Path) -> Result<Option<String>, WorldError> {
     decode_name(&name).map(Some)
 }
 
+fn write_player_state(
+    file: &mut File,
+    state: Option<&super::PlayerState>,
+) -> Result<(), WorldError> {
+    let mut payload = Vec::new();
+    let Some(state) = state else {
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+        file.write_all(&(payload.len() as u32).to_le_bytes())?;
+        file.write_all(&payload)?;
+        return Ok(());
+    };
+    payload.extend_from_slice(&1_u32.to_le_bytes());
+    payload.extend_from_slice(&state.health_current().to_le_bytes());
+    payload.extend_from_slice(&state.health_maximum().to_le_bytes());
+    payload.extend_from_slice(&(state.inventory().selected_hotbar() as u16).to_le_bytes());
+    payload.extend_from_slice(&(INVENTORY_SLOTS as u16).to_le_bytes());
+    let (cursor_item, cursor_quantity) = state
+        .cursor_stack()
+        .map(|stack| (stack.item().raw(), stack.quantity()))
+        .unwrap_or((0, 0));
+    payload.extend_from_slice(&cursor_item.to_le_bytes());
+    payload.extend_from_slice(&cursor_quantity.to_le_bytes());
+    for slot in state.inventory().slots() {
+        let (item, quantity) = slot
+            .map(|stack| (stack.item().raw(), stack.quantity()))
+            .unwrap_or((0, 0));
+        payload.extend_from_slice(&item.to_le_bytes());
+        payload.extend_from_slice(&quantity.to_le_bytes());
+    }
+    for experience in state.corporation_progress().all_experience() {
+        payload.extend_from_slice(&experience.to_le_bytes());
+    }
+    encode_mission_state(state, &mut payload)?;
+    if payload.len() > MAX_PLAYER_STATE_PAYLOAD_SIZE {
+        return invalid("player state exceeds its maximum encoded size");
+    }
+    file.write_all(&(payload.len() as u32).to_le_bytes())?;
+    file.write_all(&payload)?;
+    Ok(())
+}
+
+fn read_player_state(
+    bytes: &[u8],
+    has_corporation_progress: bool,
+    mission_state_version: Option<u16>,
+) -> Result<Option<super::PlayerState>, WorldError> {
+    let mut cursor = 0;
+    let present = read_u32(bytes, &mut cursor)?;
+    if present > 1 {
+        return invalid("invalid player state flag");
+    }
+    if present == 0 {
+        if mission_state_version.is_none() && bytes[cursor..].iter().any(|&byte| byte != 0) {
+            return invalid("absent player state contains data");
+        }
+        if mission_state_version.is_some() && cursor != bytes.len() {
+            return invalid("absent player state contains data");
+        }
+        return Ok(None);
+    }
+    let health_current = read_u16(bytes, &mut cursor)?;
+    let health_maximum = read_u16(bytes, &mut cursor)?;
+    let selected_hotbar = usize::from(read_u16(bytes, &mut cursor)?);
+    let slot_count = usize::from(read_u16(bytes, &mut cursor)?);
+    if slot_count != INVENTORY_SLOTS || selected_hotbar >= HOTBAR_SLOTS {
+        return invalid("player inventory dimensions are invalid");
+    }
+    let cursor_item = read_u16(bytes, &mut cursor)?;
+    let cursor_quantity = read_u16(bytes, &mut cursor)?;
+    let cursor_stack = match (cursor_item, cursor_quantity) {
+        (0, 0) => None,
+        (0, _) | (_, 0) => return invalid("player cursor contains a partial empty stack"),
+        (item, quantity) => ItemStack::new(ItemId::new(item), quantity),
+    };
+    let mut slots = Vec::with_capacity(INVENTORY_SLOTS);
+    for _ in 0..INVENTORY_SLOTS {
+        let item = read_u16(bytes, &mut cursor)?;
+        let quantity = read_u16(bytes, &mut cursor)?;
+        slots.push(match (item, quantity) {
+            (0, 0) => None,
+            (0, _) | (_, 0) => return invalid("player inventory contains a partial empty stack"),
+            (item, quantity) => ItemStack::new(ItemId::new(item), quantity),
+        });
+    }
+    let inventory = Inventory::from_saved_slots(slots, selected_hotbar)
+        .ok_or_else(|| WorldError::InvalidData("player inventory dimensions are invalid".into()))?;
+    let corporation_progress = if has_corporation_progress {
+        let mut experience = [0; ContractCompany::ALL.len()];
+        for value in &mut experience {
+            *value = read_u32(bytes, &mut cursor)?;
+        }
+        CorporationProgress::from_experience(experience)
+    } else {
+        CorporationProgress::default()
+    };
+    let mission_state = mission_state_version
+        .map(|version| decode_mission_state(bytes, &mut cursor, version))
+        .transpose()?;
+    if cursor != bytes.len() {
+        return invalid("player state contains trailing data");
+    }
+    super::PlayerState::new(health_current, health_maximum, inventory)
+        .map(|state| {
+            let state = state
+                .with_cursor_stack(cursor_stack)
+                .with_corporation_progress(corporation_progress);
+            if let Some((contracts, transmissions, tutorial, deliveries)) = mission_state {
+                state.with_mission_state(contracts, transmissions, tutorial, deliveries)
+            } else {
+                state
+            }
+        })
+        .map(Some)
+        .ok_or_else(|| WorldError::InvalidData("player health is invalid".into()))
+}
+
+fn encode_mission_state(
+    state: &super::PlayerState,
+    output: &mut Vec<u8>,
+) -> Result<(), WorldError> {
+    encode_contracts(state.contract_board().available(), output)?;
+    encode_contracts(state.contract_board().active(), output)?;
+
+    let transmissions = state.transmission_log();
+    let history_count = u32::try_from(transmissions.history().len())
+        .map_err(|_| WorldError::InvalidData("too many transmissions".into()))?;
+    if transmissions.history().len() > MAX_TRANSMISSIONS {
+        return invalid("too many transmissions");
+    }
+    output.extend_from_slice(&history_count.to_le_bytes());
+    for transmission in transmissions.history() {
+        output.extend_from_slice(&transmission.sequence().to_le_bytes());
+        encode_bounded_string(transmission.sender(), MAX_TRANSMISSION_TEXT_BYTES, output)?;
+        encode_bounded_string(transmission.subject(), MAX_TRANSMISSION_TEXT_BYTES, output)?;
+        encode_bounded_string(transmission.body(), MAX_TRANSMISSION_TEXT_BYTES, output)?;
+    }
+    let (incoming, queued) = transmissions.saved_indices();
+    output.extend_from_slice(
+        &incoming
+            .map_or(u32::MAX, |index| u32::try_from(index).unwrap_or(u32::MAX))
+            .to_le_bytes(),
+    );
+    let queued: Vec<_> = queued.collect();
+    let queued_count = u32::try_from(queued.len())
+        .map_err(|_| WorldError::InvalidData("too many queued transmissions".into()))?;
+    output.extend_from_slice(&queued_count.to_le_bytes());
+    for index in queued {
+        let index = u32::try_from(index)
+            .map_err(|_| WorldError::InvalidData("transmission index is too large".into()))?;
+        output.extend_from_slice(&index.to_le_bytes());
+    }
+
+    let (tutorial_stage, tutorial_remaining, progress) = state.tutorial_program().saved_state();
+    output.push(tutorial_stage);
+    output.extend_from_slice(&tutorial_remaining.to_bits().to_le_bytes());
+    for value in [
+        progress.completed_missions,
+        progress.issued_packages,
+        progress.facts,
+        progress.stone_extracted,
+        progress.stone_exported,
+        progress.iron_acquired,
+        progress.iron_processed,
+        progress.asterite_acquired,
+        progress.asterite_exported,
+    ] {
+        output.extend_from_slice(&value.to_le_bytes());
+    }
+    output.extend_from_slice(&progress.maximum_depth_decimetres.to_le_bytes());
+
+    let (delivery_elapsed, drop_sequence, deliveries) = state.delivery_system().saved_state();
+    output.extend_from_slice(&delivery_elapsed.to_bits().to_le_bytes());
+    output.extend_from_slice(&drop_sequence.to_le_bytes());
+    let deliveries: Vec<_> = deliveries.collect();
+    let delivery_count = u16::try_from(deliveries.len())
+        .map_err(|_| WorldError::InvalidData("too many pending deliveries".into()))?;
+    output.extend_from_slice(&delivery_count.to_le_bytes());
+    for (item, remaining) in deliveries {
+        output.extend_from_slice(&item.raw().to_le_bytes());
+        output.extend_from_slice(&remaining.to_bits().to_le_bytes());
+    }
+    Ok(())
+}
+
+fn encode_contracts(contracts: &[Contract], output: &mut Vec<u8>) -> Result<(), WorldError> {
+    if contracts.len() > MAX_CONTRACTS_PER_BOARD_LIST {
+        return invalid("too many contracts");
+    }
+    output.extend_from_slice(&(contracts.len() as u32).to_le_bytes());
+    for contract in contracts {
+        output.push(contract.id().map_or(0, contract_id_tag));
+        encode_bounded_string(
+            &contract.requirement,
+            MAX_CONTRACT_REQUIREMENT_BYTES,
+            output,
+        )?;
+        output.extend_from_slice(&contract.reward.to_le_bytes());
+        output.push(match contract.company {
+            ContractCompany::DeepTekIndustries => 0,
+            ContractCompany::VanguardDefence => 1,
+            ContractCompany::AstraSurveyCorp => 2,
+        });
+        output.extend_from_slice(&contract.experience_reward.to_le_bytes());
+        match contract.saved_objective() {
+            SavedContractObjective::None => output.push(0),
+            SavedContractObjective::ExportItems {
+                item,
+                exported,
+                required,
+            } => {
+                output.push(1);
+                encode_item_progress(item, exported, required, output);
+            }
+            SavedContractObjective::MineItems {
+                item,
+                mined,
+                required,
+            } => {
+                output.push(2);
+                encode_item_progress(item, mined, required, output);
+            }
+            SavedContractObjective::BuildAndExport {
+                required_objects,
+                placed_objects,
+                item,
+                exported,
+                required,
+            } => {
+                output.push(3);
+                encode_object_types(&required_objects, output)?;
+                encode_object_types(&placed_objects, output)?;
+                encode_item_progress(item, exported, required, output);
+            }
+            SavedContractObjective::Program {
+                completed,
+                required,
+            } => {
+                output.push(4);
+                output.extend_from_slice(&completed.to_le_bytes());
+                output.extend_from_slice(&required.to_le_bytes());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn encode_item_progress(item: ItemId, progress: u64, required: u64, output: &mut Vec<u8>) {
+    output.extend_from_slice(&item.raw().to_le_bytes());
+    output.extend_from_slice(&progress.to_le_bytes());
+    output.extend_from_slice(&required.to_le_bytes());
+}
+
+fn encode_object_types(
+    object_types: &[ObjectTypeId],
+    output: &mut Vec<u8>,
+) -> Result<(), WorldError> {
+    let count = u16::try_from(object_types.len())
+        .map_err(|_| WorldError::InvalidData("too many contract object requirements".into()))?;
+    output.extend_from_slice(&count.to_le_bytes());
+    for object_type in object_types {
+        output.extend_from_slice(&object_type.raw().to_le_bytes());
+    }
+    Ok(())
+}
+
+fn encode_bounded_string(
+    value: &str,
+    maximum_bytes: usize,
+    output: &mut Vec<u8>,
+) -> Result<(), WorldError> {
+    if value.len() > maximum_bytes {
+        return invalid("mission text exceeds its maximum encoded length");
+    }
+    output.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    output.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn decode_mission_state(
+    bytes: &[u8],
+    cursor: &mut usize,
+    version: u16,
+) -> Result<
+    (
+        ContractBoard,
+        TransmissionLog,
+        TutorialProgram,
+        DeliverySystem,
+    ),
+    WorldError,
+> {
+    let available = decode_contracts(bytes, cursor)?;
+    let active = decode_contracts(bytes, cursor)?;
+    let contracts = ContractBoard::from_saved(available, active)
+        .ok_or_else(|| WorldError::InvalidData("contract board is invalid".into()))?;
+
+    let history_count = read_u32(bytes, cursor)? as usize;
+    if history_count > MAX_TRANSMISSIONS {
+        return invalid("too many transmissions");
+    }
+    let mut history = Vec::with_capacity(history_count);
+    for _ in 0..history_count {
+        history.push(Transmission::from_saved(
+            read_u64(bytes, cursor)?,
+            decode_bounded_string(bytes, cursor, MAX_TRANSMISSION_TEXT_BYTES)?,
+            decode_bounded_string(bytes, cursor, MAX_TRANSMISSION_TEXT_BYTES)?,
+            decode_bounded_string(bytes, cursor, MAX_TRANSMISSION_TEXT_BYTES)?,
+        ));
+    }
+    let incoming = match read_u32(bytes, cursor)? {
+        u32::MAX => None,
+        index => Some(index as usize),
+    };
+    let queued_count = read_u32(bytes, cursor)? as usize;
+    if queued_count > MAX_TRANSMISSIONS {
+        return invalid("too many queued transmissions");
+    }
+    let mut queued = VecDeque::with_capacity(queued_count);
+    for _ in 0..queued_count {
+        queued.push_back(read_u32(bytes, cursor)? as usize);
+    }
+    let transmissions = TransmissionLog::from_saved(history, incoming, queued)
+        .ok_or_else(|| WorldError::InvalidData("transmission log is invalid".into()))?;
+
+    let tutorial_stage = *take(bytes, cursor, 1)?
+        .first()
+        .expect("one tutorial stage byte was taken");
+    let tutorial_remaining = f32::from_bits(read_u32(bytes, cursor)?);
+    let progress = if version >= PROSPECTOR_PROGRESS_VERSION {
+        Some(SavedProspectorProgress {
+            completed_missions: read_u64(bytes, cursor)?,
+            issued_packages: read_u64(bytes, cursor)?,
+            facts: read_u64(bytes, cursor)?,
+            stone_extracted: read_u64(bytes, cursor)?,
+            stone_exported: read_u64(bytes, cursor)?,
+            iron_acquired: read_u64(bytes, cursor)?,
+            iron_processed: read_u64(bytes, cursor)?,
+            asterite_acquired: read_u64(bytes, cursor)?,
+            asterite_exported: read_u64(bytes, cursor)?,
+            maximum_depth_decimetres: read_u32(bytes, cursor)?,
+        })
+    } else {
+        None
+    };
+    let tutorial = TutorialProgram::from_saved(tutorial_stage, tutorial_remaining, progress)
+        .ok_or_else(|| WorldError::InvalidData("tutorial state is invalid".into()))?;
+
+    let delivery_elapsed = f32::from_bits(read_u32(bytes, cursor)?);
+    let drop_sequence = read_u32(bytes, cursor)?;
+    let delivery_count = read_u16(bytes, cursor)? as usize;
+    let mut pending = Vec::with_capacity(delivery_count);
+    for _ in 0..delivery_count {
+        pending.push((
+            ItemId::new(read_u16(bytes, cursor)?),
+            f32::from_bits(read_u32(bytes, cursor)?),
+        ));
+    }
+    let deliveries = DeliverySystem::from_saved(delivery_elapsed, drop_sequence, pending)
+        .ok_or_else(|| WorldError::InvalidData("delivery queue is invalid".into()))?;
+    Ok((contracts, transmissions, tutorial, deliveries))
+}
+
+fn decode_contracts(bytes: &[u8], cursor: &mut usize) -> Result<Vec<Contract>, WorldError> {
+    let count = read_u32(bytes, cursor)? as usize;
+    if count > MAX_CONTRACTS_PER_BOARD_LIST {
+        return invalid("too many contracts");
+    }
+    let mut contracts = Vec::with_capacity(count);
+    for _ in 0..count {
+        let id = match *take(bytes, cursor, 1)?
+            .first()
+            .expect("one contract ID byte was taken")
+        {
+            0 => None,
+            tag => Some(contract_id_from_tag(tag).ok_or_else(|| {
+                WorldError::InvalidData("contract contains an unknown ID".into())
+            })?),
+        };
+        let requirement = decode_bounded_string(bytes, cursor, MAX_CONTRACT_REQUIREMENT_BYTES)?;
+        let reward = read_u64(bytes, cursor)?;
+        let company = match *take(bytes, cursor, 1)?
+            .first()
+            .expect("one contract company byte was taken")
+        {
+            0 => ContractCompany::DeepTekIndustries,
+            1 => ContractCompany::VanguardDefence,
+            2 => ContractCompany::AstraSurveyCorp,
+            _ => return invalid("contract contains an unknown company"),
+        };
+        let experience_reward = read_u32(bytes, cursor)?;
+        let objective_tag = *take(bytes, cursor, 1)?
+            .first()
+            .expect("one contract objective byte was taken");
+        let objective = match objective_tag {
+            0 => SavedContractObjective::None,
+            1 => {
+                let (item, progress, required) = decode_item_progress(bytes, cursor)?;
+                SavedContractObjective::ExportItems {
+                    item,
+                    exported: progress,
+                    required,
+                }
+            }
+            2 => {
+                let (item, progress, required) = decode_item_progress(bytes, cursor)?;
+                SavedContractObjective::MineItems {
+                    item,
+                    mined: progress,
+                    required,
+                }
+            }
+            3 => {
+                let required_objects = decode_object_types(bytes, cursor)?;
+                let placed_objects = decode_object_types(bytes, cursor)?;
+                let (item, exported, required) = decode_item_progress(bytes, cursor)?;
+                SavedContractObjective::BuildAndExport {
+                    required_objects,
+                    placed_objects,
+                    item,
+                    exported,
+                    required,
+                }
+            }
+            4 => SavedContractObjective::Program {
+                completed: read_u16(bytes, cursor)?,
+                required: read_u16(bytes, cursor)?,
+            },
+            _ => return invalid("contract contains an unknown objective"),
+        };
+        contracts.push(
+            Contract::from_saved(
+                id,
+                requirement,
+                reward,
+                company,
+                experience_reward,
+                objective,
+            )
+            .ok_or_else(|| WorldError::InvalidData("contract state is invalid".into()))?,
+        );
+    }
+    Ok(contracts)
+}
+
+const fn contract_id_tag(id: ContractId) -> u8 {
+    match id {
+        ContractId::BreakingGround => 1,
+        ContractId::FirstShipment => 2,
+        ContractId::SitePower => 3,
+        ContractId::Procurement => 4,
+        ContractId::IndustrialExtraction => 5,
+        ContractId::Prospecting => 6,
+        ContractId::IronAge => 7,
+        ContractId::GoingDown => 8,
+        ContractId::ValueAdded => 9,
+        ContractId::HandsOff => 10,
+        ContractId::HelpWanted => 11,
+        ContractId::Depth100 => 12,
+        ContractId::Depth250 => 13,
+        ContractId::Depth500 => 14,
+        ContractId::Depth1000 => 15,
+        ContractId::Depth2500 => 16,
+        ContractId::Depth5000 => 17,
+        ContractId::RecoverAsterite => 18,
+    }
+}
+
+const fn contract_id_from_tag(tag: u8) -> Option<ContractId> {
+    Some(match tag {
+        1 => ContractId::BreakingGround,
+        2 => ContractId::FirstShipment,
+        3 => ContractId::SitePower,
+        4 => ContractId::Procurement,
+        5 => ContractId::IndustrialExtraction,
+        6 => ContractId::Prospecting,
+        7 => ContractId::IronAge,
+        8 => ContractId::GoingDown,
+        9 => ContractId::ValueAdded,
+        10 => ContractId::HandsOff,
+        11 => ContractId::HelpWanted,
+        12 => ContractId::Depth100,
+        13 => ContractId::Depth250,
+        14 => ContractId::Depth500,
+        15 => ContractId::Depth1000,
+        16 => ContractId::Depth2500,
+        17 => ContractId::Depth5000,
+        18 => ContractId::RecoverAsterite,
+        _ => return None,
+    })
+}
+
+fn decode_item_progress(
+    bytes: &[u8],
+    cursor: &mut usize,
+) -> Result<(ItemId, u64, u64), WorldError> {
+    let item = ItemId::new(read_u16(bytes, cursor)?);
+    let progress = read_u64(bytes, cursor)?;
+    let required = read_u64(bytes, cursor)?;
+    Ok((item, progress, required))
+}
+
+fn decode_object_types(bytes: &[u8], cursor: &mut usize) -> Result<Vec<ObjectTypeId>, WorldError> {
+    let count = read_u16(bytes, cursor)? as usize;
+    let mut object_types = Vec::with_capacity(count);
+    for _ in 0..count {
+        object_types.push(ObjectTypeId::new(read_u16(bytes, cursor)?));
+    }
+    Ok(object_types)
+}
+
+fn decode_bounded_string(
+    bytes: &[u8],
+    cursor: &mut usize,
+    maximum_bytes: usize,
+) -> Result<String, WorldError> {
+    let length = read_u32(bytes, cursor)? as usize;
+    if length > maximum_bytes {
+        return invalid("mission text exceeds its maximum encoded length");
+    }
+    let value = std::str::from_utf8(take(bytes, cursor, length)?)
+        .map_err(|_| WorldError::InvalidData("mission text is not valid UTF-8".into()))?;
+    Ok(value.to_owned())
+}
+
 fn decode_name(bytes: &[u8]) -> Result<String, WorldError> {
     if bytes.len() > MAX_WORLD_NAME_BYTES {
         return invalid("world name exceeds its maximum encoded length");
@@ -332,488 +1011,136 @@ fn decode_name(bytes: &[u8]) -> Result<String, WorldError> {
     Ok(name.to_owned())
 }
 
-fn encode_objects(world: &World) -> Vec<u8> {
-    let container_bytes: usize = world
-        .objects
-        .containers
-        .values()
-        .map(|container| CONTAINER_HEADER_SIZE + container.slots().len() * CONTAINER_SLOT_SIZE)
-        .sum();
-    let mut output = Vec::with_capacity(
-        OBJECT_HEADER_SIZE + world.objects.objects.len() * OBJECT_RECORD_SIZE + container_bytes,
-    );
-    output.extend_from_slice(&world.simulation_tick.to_le_bytes());
-    output.extend_from_slice(&world.simulation_remainder_nanos.to_le_bytes());
-    output.extend_from_slice(&world.objects.next_id.to_le_bytes());
-    output.extend_from_slice(&(world.objects.objects.len() as u32).to_le_bytes());
-    output.extend_from_slice(&(world.objects.containers.len() as u32).to_le_bytes());
-    for object in &world.objects.objects {
-        output.extend_from_slice(&object.id.raw().to_le_bytes());
-        output.extend_from_slice(&object.object_type.raw().to_le_bytes());
-        output.push(object.variant);
-        output.push(object.growth_stage);
-        output.push(u8::from(object.active));
-        output.extend_from_slice(&object.anchor.x.to_le_bytes());
-        output.extend_from_slice(&object.anchor.y.to_le_bytes());
-        output.extend_from_slice(&object.root.x.to_le_bytes());
-        output.extend_from_slice(&object.root.y.to_le_bytes());
-        output.extend_from_slice(&object.width.to_le_bytes());
-        output.extend_from_slice(&object.height.to_le_bytes());
-        output.extend_from_slice(&object.next_update_tick.to_le_bytes());
-        output.extend_from_slice(&object.stored_energy_milli.to_le_bytes());
-        output.extend_from_slice(&object.machine_target_y.to_le_bytes());
-        output.extend_from_slice(&object.kill_count.to_le_bytes());
-        output.extend_from_slice(&object.linked_object.to_le_bytes());
-        output.extend_from_slice(&object.motion_position_milli.to_le_bytes());
-    }
-    let mut containers: Vec<_> = world.objects.containers.iter().collect();
-    containers.sort_unstable_by_key(|(id, _)| **id);
-    for (id, container) in containers {
-        output.extend_from_slice(&id.raw().to_le_bytes());
-        output.extend_from_slice(&(container.slots().len() as u16).to_le_bytes());
-        output.extend_from_slice(&0_u16.to_le_bytes());
-        for slot in container.slots() {
-            let (item, quantity) = slot
-                .map(|stack| (stack.item().raw(), stack.quantity()))
-                .unwrap_or((0, 0));
-            output.extend_from_slice(&item.to_le_bytes());
-            output.extend_from_slice(&quantity.to_le_bytes());
+fn encode_specialists(world: &World) -> Result<Vec<u8>, WorldError> {
+    let count = u16::try_from(world.specialists().len())
+        .map_err(|_| WorldError::InvalidData("too many specialists".into()))?;
+    let mut seen = std::collections::HashSet::new();
+    let mut output = Vec::with_capacity(2 + usize::from(count) * 19);
+    output.extend_from_slice(&count.to_le_bytes());
+    for specialist in world.specialists() {
+        if specialist_definition(specialist.id()).is_none() || !seen.insert(specialist.id()) {
+            return invalid("specialist records contain an unknown or duplicate ID");
         }
+        if !world
+            .object(specialist.home_terminal())
+            .is_some_and(|object| object.object_type() == FurnitureObject::PROCUREMENT_TERMINAL)
+        {
+            return invalid("specialist home references a missing terminal");
+        }
+        let [x, y] = specialist.position();
+        if !x.is_finite()
+            || !y.is_finite()
+            || !(0.0..world.width() as f32).contains(&x)
+            || !(0.0..world.height() as f32).contains(&y)
+            || specialist.happiness() > 100
+        {
+            return invalid("specialist state is invalid");
+        }
+        output.extend_from_slice(&specialist.id().raw().to_le_bytes());
+        output.extend_from_slice(&specialist.home_terminal().raw().to_le_bytes());
+        output.extend_from_slice(&x.to_bits().to_le_bytes());
+        output.extend_from_slice(&y.to_bits().to_le_bytes());
+        output.push(specialist.happiness());
     }
-    output
+    Ok(output)
 }
 
-fn decode_objects(world: &mut World, bytes: &[u8], version: u16) -> Result<(), WorldError> {
-    if bytes.len() < OBJECT_HEADER_SIZE {
-        return invalid("object section is shorter than its header");
-    }
+fn decode_specialists(world: &mut World, bytes: &[u8]) -> Result<(), WorldError> {
     let mut cursor = 0;
-    let simulation_tick = read_u64(bytes, &mut cursor)?;
-    let simulation_remainder_nanos = read_u64(bytes, &mut cursor)?;
-    if simulation_remainder_nanos >= 1_000_000_000 {
-        return invalid("simulation remainder is outside one tick");
+    let count = usize::from(read_u16(bytes, &mut cursor)?);
+    if count > BUILT_IN_SPECIALISTS.len() || bytes.len() != 2 + count * 19 {
+        return invalid("specialist section has invalid dimensions");
     }
-    let next_id = read_u64(bytes, &mut cursor)?;
-    let object_count = read_u32(bytes, &mut cursor)? as usize;
-    let container_count = read_u32(bytes, &mut cursor)? as usize;
-    if version == OBJECTS_VERSION && container_count != 0 {
-        return invalid("version 2 object section reserved field is non-zero");
-    }
-    let object_record_size = if version >= MOTION_VERSION {
-        OBJECT_RECORD_SIZE
-    } else if version >= STATISTICS_VERSION {
-        STATISTICS_OBJECT_RECORD_SIZE
-    } else if version >= BATTERY_STORAGE_VERSION {
-        BATTERY_OBJECT_RECORD_SIZE
-    } else if version >= ACTIVATION_VERSION {
-        ACTIVATION_OBJECT_RECORD_SIZE
-    } else {
-        LEGACY_OBJECT_RECORD_SIZE
-    };
-    let object_records_len = object_count
-        .checked_mul(object_record_size)
-        .ok_or_else(|| WorldError::InvalidData("object count overflow".into()))?;
-    if bytes.len().saturating_sub(cursor) < object_records_len {
-        return invalid("object count exceeds the object section length");
-    }
-    if object_count > world.width as usize * world.height as usize {
-        return invalid("object count exceeds the number of world cells");
-    }
-
-    let mut store = ObjectStore::new(world.chunks.len(), world.chunks_wide);
-    let mut max_id = 0_u64;
-    for _ in 0..object_count {
-        let id = ObjectId::from_raw(read_u64(bytes, &mut cursor)?);
-        if id.raw() == 0 || store.object(id).is_some() {
-            return invalid("object IDs must be non-zero and unique");
+    let mut seen = std::collections::HashSet::new();
+    let mut specialists = Vec::with_capacity(count);
+    for _ in 0..count {
+        let id = SpecialistId::new(read_u16(bytes, &mut cursor)?);
+        let home = ObjectId::from_raw(read_u64(bytes, &mut cursor)?);
+        let position = [
+            f32::from_bits(read_u32(bytes, &mut cursor)?),
+            f32::from_bits(read_u32(bytes, &mut cursor)?),
+        ];
+        let happiness = take(bytes, &mut cursor, 1)?[0];
+        if specialist_definition(id).is_none() || !seen.insert(id) {
+            return invalid("specialist section contains an unknown or duplicate ID");
         }
-        max_id = max_id.max(id.raw());
-        let object_type = ObjectTypeId::new(read_u16(bytes, &mut cursor)?);
-        let variant = take(bytes, &mut cursor, 1)?[0];
-        let growth_stage = take(bytes, &mut cursor, 1)?[0];
-        let active = if version >= ACTIVATION_VERSION {
-            match take(bytes, &mut cursor, 1)?[0] {
-                0 => false,
-                1 => true,
-                _ => return invalid("object active flag is not boolean"),
-            }
-        } else {
-            object_type != FurnitureObject::LASER_BORE
-        };
-        let anchor = TilePos {
-            x: read_u32(bytes, &mut cursor)?,
-            y: read_u32(bytes, &mut cursor)?,
-        };
-        let mut root = TilePos {
-            x: read_u32(bytes, &mut cursor)?,
-            y: read_u32(bytes, &mut cursor)?,
-        };
-        let width = read_u16(bytes, &mut cursor)?;
-        let height = read_u16(bytes, &mut cursor)?;
-        let mut next_update_tick = read_u64(bytes, &mut cursor)?;
-        let stored_energy_milli = if version >= BATTERY_STORAGE_VERSION {
-            read_u32(bytes, &mut cursor)?
-        } else {
-            0
-        };
-        let machine_target_y = if version >= BATTERY_STORAGE_VERSION {
-            read_u32(bytes, &mut cursor)?
-        } else {
-            u32::MAX
-        };
-        let kill_count = if version >= STATISTICS_VERSION {
-            read_u32(bytes, &mut cursor)?
-        } else {
-            0
-        };
-        let linked_object = if version >= MOTION_VERSION {
-            read_u64(bytes, &mut cursor)?
-        } else {
-            0
-        };
-        let motion_position_milli = if version >= MOTION_VERSION {
-            read_u32(bytes, &mut cursor)?
-        } else {
-            0
-        };
-        if !active
-            && furniture_definition(object_type)
-                .is_some_and(|definition| definition.interaction().is_activatable())
+        if !world
+            .object(home)
+            .is_some_and(|object| object.object_type() == FurnitureObject::PROCUREMENT_TERMINAL)
         {
-            next_update_tick = u64::MAX;
+            return invalid("specialist home references a missing terminal");
         }
-        if machine_target_y != u32::MAX
-            && (object_type != FurnitureObject::LASER_BORE || machine_target_y >= world.height)
+        if !position.into_iter().all(f32::is_finite)
+            || !(0.0..world.width() as f32).contains(&position[0])
+            || !(0.0..world.height() as f32).contains(&position[1])
+            || happiness > 100
         {
-            return invalid("machine target is invalid");
+            return invalid("specialist section contains invalid state");
         }
-        if width == 0 || height == 0 {
-            return invalid("object dimensions must be non-zero");
-        }
-        let end_x = anchor
-            .x
-            .checked_add(u32::from(width) - 1)
-            .ok_or_else(|| WorldError::InvalidData("object width overflow".into()))?;
-        let end_y = anchor
-            .y
-            .checked_add(u32::from(height) - 1)
-            .ok_or_else(|| WorldError::InvalidData("object height overflow".into()))?;
-        if end_x >= world.width
-            || end_y >= world.height
-            || root.x >= world.width
-            || root.y >= world.height
-        {
-            return invalid("object footprint or root is outside the world");
-        }
-        for y in anchor.y..=end_y {
-            for x in anchor.x..=end_x {
-                if world.tile_in_bounds(x, y, super::Layer::Foreground) != TileId::EMPTY
-                    && furniture_definition(object_type).is_none()
-                    && !matches!(
-                        object_type,
-                        super::ROPE_OBJECT | super::POWERED_CABLE_OBJECT
-                    )
-                {
-                    return invalid("object footprint overlaps a foreground tile");
-                }
-            }
-        }
-        if let Some(definition) = furniture_definition(object_type) {
-            if [width, height] != definition.size() {
-                return invalid("furniture dimensions do not match its definition");
-            }
-            if definition.interaction().configuration()
-                == Some(FurnitureConfiguration::TargetPriority)
-                && TargetPriority::from_raw(variant).is_none()
-            {
-                return invalid("furniture target priority is invalid");
-            }
-            match definition.support() {
-                FurnitureSupport::Floor | FurnitureSupport::FloorEdges => {
-                    let expected_root_y = end_y
-                        .checked_add(1)
-                        .ok_or_else(|| WorldError::InvalidData("furniture root overflow".into()))?;
-                    if root != TilePos::new(anchor.x, expected_root_y) {
-                        return invalid("furniture root does not match its floor support row");
-                    }
-                    if expected_root_y >= world.height {
-                        return invalid("furniture floor support is outside the world");
-                    }
-                    for column in 0..width {
-                        if !definition.support().requires_column(column, width) {
-                            continue;
-                        }
-                        let x = anchor.x + u32::from(column);
-                        if world.tile_in_bounds(x, expected_root_y, super::Layer::Foreground)
-                            == TileId::EMPTY
-                        {
-                            return invalid("furniture floor support tile is empty");
-                        }
-                    }
-                }
-                FurnitureSupport::Side => {
-                    let valid_root = if root == anchor {
-                        world.tile_in_bounds(anchor.x, anchor.y, super::Layer::Background)
-                            != TileId::EMPTY
-                    } else {
-                        let dx = root.x.abs_diff(anchor.x);
-                        let dy = root.y.abs_diff(anchor.y);
-                        dx + dy == 1
-                            && world.tile_in_bounds(root.x, root.y, super::Layer::Foreground)
-                                != TileId::EMPTY
-                    };
-                    if !valid_root {
-                        return invalid("side-supported furniture root is missing");
-                    }
-                }
-                FurnitureSupport::Free => {
-                    let legacy_floor_root = TilePos::new(anchor.x, end_y.saturating_add(1));
-                    if root == legacy_floor_root && definition.is_item_transport_connector() {
-                        root = anchor;
-                    } else if root != anchor {
-                        return invalid("free-standing furniture root does not match its anchor");
-                    }
-                }
-            }
-            if stored_energy_milli > definition.power_capacity_milli() {
-                return invalid("stored energy exceeds furniture capacity");
-            }
-            if kill_count != 0 && object_type != FurnitureObject::TURRET {
-                return invalid("non-turret furniture contains a kill count");
-            }
-            if object_type == FurnitureObject::CARGO_LIFT {
-                if linked_object == 0
-                    || super::CargoLiftDirection::from_raw(variant).is_none()
-                    || motion_position_milli / 1_000 >= world.height
-                    || motion_position_milli.saturating_add(500) / 1_000 != anchor.y
-                {
-                    return invalid("cargo lift motion state is invalid");
-                }
-            } else if object_type == FurnitureObject::LIFT_STATION {
-                if version < VERSION
-                    || linked_object == 0
-                    || motion_position_milli != 0
-                    || LiftStationConfiguration::from_raw(variant).is_none()
-                {
-                    return invalid("lift station state is invalid");
-                }
-            } else if linked_object != 0 || motion_position_milli != 0 {
-                return invalid("stationary furniture contains cargo lift motion state");
-            }
-        } else if stored_energy_milli != 0 {
-            return invalid("non-furniture object contains stored energy");
-        } else if kill_count != 0 {
-            return invalid("non-furniture object contains a kill count");
-        } else if linked_object != 0 || motion_position_milli != 0 {
-            return invalid("non-furniture object contains cargo lift motion state");
-        } else if object_type != super::POWERED_CABLE_OBJECT
-            && world.tile_in_bounds(root.x, root.y, super::Layer::Foreground) == TileId::EMPTY
-        {
-            return invalid("object root tile is empty");
-        }
-        store
-            .insert(WorldObject {
-                id,
-                object_type,
-                anchor,
-                root,
-                width,
-                height,
-                variant,
-                growth_stage,
-                active,
-                stored_energy_milli,
-                machine_target_y,
-                kill_count,
-                linked_object,
-                motion_position_milli,
-                next_update_tick,
-            })
-            .map_err(|error| WorldError::InvalidData(error.to_string()))?;
+        specialists.push(crate::SpecialistRecord::from_saved(
+            id, home, position, happiness,
+        ));
     }
-    let lift_sides: HashMap<_, _> = store
-        .objects
-        .iter()
-        .filter(|object| object.object_type == FurnitureObject::CARGO_LIFT)
-        .filter_map(|lift| {
-            store
-                .object(ObjectId::from_raw(lift.linked_object))
-                .map(|cable| (cable.id, lift.anchor.x > cable.anchor.x))
-        })
-        .collect();
-    let mut station_sides = HashMap::<ObjectId, bool>::new();
-    let mut station_heights = HashSet::<(ObjectId, u32)>::new();
-    for object in &store.objects {
-        if object.object_type == super::POWERED_CABLE_OBJECT {
-            let expected_root = object
-                .anchor
-                .y
-                .checked_sub(1)
-                .map(|y| TilePos::new(object.anchor.x, y));
-            if object.width != 1
-                || expected_root != Some(object.root)
-                || store
-                    .occupying(object.root)
-                    .and_then(|anchor| store.object(anchor))
-                    .is_none_or(|anchor| {
-                        anchor.object_type != FurnitureObject::POWERED_CABLE_ANCHOR
-                    })
-            {
-                return invalid("powered cable is not attached to its top anchor");
-            }
-        }
-        if object.object_type == FurnitureObject::CARGO_LIFT {
-            let cable = store
-                .object(ObjectId::from_raw(object.linked_object))
-                .filter(|cable| cable.object_type == super::POWERED_CABLE_OBJECT)
-                .ok_or_else(|| {
-                    WorldError::InvalidData("cargo lift references a missing powered cable".into())
-                })?;
-            let maximum = cable
-                .anchor
-                .y
-                .checked_add(u32::from(cable.height).saturating_sub(2));
-            if cable.height < 2
-                || maximum.is_none()
-                || {
-                    let maximum = maximum.unwrap();
-                    !(cable.anchor.y..=maximum).contains(&object.anchor.y)
-                }
-                || !(object.anchor.x == cable.anchor.x + 1
-                    || object.anchor.x.checked_add(2) == Some(cable.anchor.x))
-            {
-                return invalid("cargo lift is outside its powered cable track");
-            }
-        }
-        if object.object_type == FurnitureObject::LIFT_STATION {
-            let cable = store
-                .object(ObjectId::from_raw(object.linked_object))
-                .filter(|cable| cable.object_type == super::POWERED_CABLE_OBJECT)
-                .ok_or_else(|| {
-                    WorldError::InvalidData(
-                        "lift station references a missing powered cable".into(),
-                    )
-                })?;
-            let maximum = cable
-                .anchor
-                .y
-                .checked_add(u32::from(cable.height).saturating_sub(2));
-            let is_right = object.anchor.x == cable.anchor.x + 1;
-            let is_left = object.anchor.x.checked_add(2) == Some(cable.anchor.x);
-            if cable.height < 2
-                || maximum.is_none()
-                || !(cable.anchor.y..=maximum.unwrap()).contains(&object.anchor.y)
-                || !is_right && !is_left
-                || lift_sides
-                    .get(&cable.id)
-                    .is_some_and(|&lift_is_right| lift_is_right == is_right)
-                || station_sides
-                    .insert(cable.id, is_right)
-                    .is_some_and(|side| side != is_right)
-                || !station_heights.insert((cable.id, object.anchor.y))
-            {
-                return invalid("lift station is outside its powered cable track");
-            }
-        }
-    }
-    if version == OBJECTS_VERSION {
-        if cursor != bytes.len() {
-            return invalid("version 2 object count does not match section length");
-        }
-        for object in &store.objects {
-            if let Some(slots) = furniture_definition(object.object_type)
-                .and_then(|definition| definition.interaction().container_slots())
-            {
-                store
-                    .containers
-                    .insert(object.id, ItemContainer::new(usize::from(slots)));
-            }
-        }
-    } else {
-        decode_containers(&mut store, bytes, &mut cursor, container_count, version)?;
-        if cursor != bytes.len() {
-            return invalid("unexpected trailing container data");
-        }
-    }
-    if next_id <= max_id {
-        return invalid("next object ID does not follow saved object IDs");
-    }
-    store.next_id = next_id;
-    world.objects = store;
-    world.simulation_tick = simulation_tick;
-    world.simulation_remainder_nanos = simulation_remainder_nanos;
+    world.specialists = specialists;
     Ok(())
 }
 
-fn decode_containers(
-    store: &mut ObjectStore,
-    bytes: &[u8],
-    cursor: &mut usize,
-    container_count: usize,
-    version: u16,
-) -> Result<(), WorldError> {
-    if container_count > store.objects.len() {
-        return invalid("container count exceeds object count");
-    }
-    for _ in 0..container_count {
-        let object_id = ObjectId::from_raw(read_u64(bytes, cursor)?);
-        let slot_count = read_u16(bytes, cursor)?;
-        let reserved = read_u16(bytes, cursor)?;
-        if reserved != 0 {
-            return invalid("container reserved field is non-zero");
-        }
-        if store.containers.contains_key(&object_id) {
-            return invalid("container object IDs must be unique");
-        }
-        let object = store.object(object_id).ok_or_else(|| {
-            WorldError::InvalidData("container references a missing object".into())
-        })?;
-        let expected_slots = furniture_definition(object.object_type)
-            .and_then(|definition| definition.interaction().container_slots())
-            .ok_or_else(|| {
-                WorldError::InvalidData("container references non-container furniture".into())
-            })?;
-        if slot_count != expected_slots {
-            return invalid("container slot count does not match its furniture definition");
-        }
-        let mut container = ItemContainer::new(usize::from(slot_count));
-        for slot in 0..usize::from(slot_count) {
-            let item = read_u16(bytes, cursor)?;
-            let quantity = read_u16(bytes, cursor)?;
-            let stack = match (item, quantity) {
-                (0, 0) => None,
-                (0, _) | (_, 0) => return invalid("container slot has a partial empty stack"),
-                (item, quantity) => ItemStack::new(ItemId::new(item), quantity),
-            };
-            debug_assert!(container.set_slot(slot, stack));
-        }
-        store.containers.insert(object_id, container);
-    }
-    if version < BORE_CONTAINER_VERSION {
-        let legacy_bores: Vec<_> = store
-            .objects
-            .iter()
-            .filter(|object| object.object_type == FurnitureObject::LASER_BORE)
-            .filter(|object| !store.containers.contains_key(&object.id))
-            .map(|object| object.id)
-            .collect();
-        for id in legacy_bores {
-            let slots = furniture_definition(FurnitureObject::LASER_BORE)
-                .and_then(|definition| definition.interaction().container_slots())
-                .expect("laser bores expose container storage");
-            store
-                .containers
-                .insert(id, ItemContainer::new(usize::from(slots)));
-        }
-    }
-    let missing_container = store.objects.iter().any(|object| {
-        furniture_definition(object.object_type).is_some_and(|definition| {
-            definition.interaction().container_slots().is_some()
-                && !store.containers.contains_key(&object.id)
-        })
+const BLOCK_DAMAGE_RECORD_SIZE: usize = 11;
+
+fn encode_block_damage(world: &World) -> Result<Vec<u8>, WorldError> {
+    let mut entries: Vec<_> = world.block_damage_entries().collect();
+    entries.sort_unstable_by_key(|(key, _)| {
+        let layer = match key.layer {
+            Layer::Foreground => 0,
+            Layer::Background => 1,
+        };
+        (key.position.y, key.position.x, layer)
     });
-    if missing_container {
-        return invalid("container furniture is missing its storage record");
+    let count = u32::try_from(entries.len())
+        .map_err(|_| WorldError::InvalidData("too many damaged blocks".into()))?;
+    let mut output = Vec::with_capacity(4 + entries.len() * BLOCK_DAMAGE_RECORD_SIZE);
+    output.extend_from_slice(&count.to_le_bytes());
+    for (key, damage) in entries {
+        let valid = world
+            .block_health(key.position, key.layer)?
+            .is_some_and(|health| health.damage() == damage && damage < health.maximum());
+        if !valid {
+            return invalid("block damage store contains invalid state");
+        }
+        output.extend_from_slice(&key.position.x.to_le_bytes());
+        output.extend_from_slice(&key.position.y.to_le_bytes());
+        output.push(match key.layer {
+            Layer::Foreground => 0,
+            Layer::Background => 1,
+        });
+        output.extend_from_slice(&damage.to_le_bytes());
+    }
+    Ok(output)
+}
+
+fn decode_block_damage(world: &mut World, bytes: &[u8]) -> Result<(), WorldError> {
+    let mut cursor = 0;
+    let count = read_u32(bytes, &mut cursor)? as usize;
+    let expected_len = 4_usize
+        .checked_add(
+            count
+                .checked_mul(BLOCK_DAMAGE_RECORD_SIZE)
+                .ok_or_else(|| WorldError::InvalidData("block damage size overflow".into()))?,
+        )
+        .ok_or_else(|| WorldError::InvalidData("block damage size overflow".into()))?;
+    let maximum_records = u64::from(world.width()) * u64::from(world.height()) * 2;
+    if bytes.len() != expected_len || count as u64 > maximum_records {
+        return invalid("block durability section has invalid dimensions");
+    }
+    for _ in 0..count {
+        let position = TilePos::new(read_u32(bytes, &mut cursor)?, read_u32(bytes, &mut cursor)?);
+        let layer = match take(bytes, &mut cursor, 1)?[0] {
+            0 => Layer::Foreground,
+            1 => Layer::Background,
+            _ => return invalid("block durability section has an invalid layer"),
+        };
+        let damage = read_u16(bytes, &mut cursor)?;
+        world.restore_block_damage(position, layer, damage)?;
     }
     Ok(())
 }

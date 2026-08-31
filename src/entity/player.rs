@@ -91,6 +91,7 @@ const PLAYER_ARM_SCALE: [f32; 2] = [0.7, 1.24];
 const PLAYER_ARM_OFFSET: [f32; 2] = [-0.06, 0.05];
 const PLAYER_ARM_DEPTH: f32 = 0.09;
 const PLAYER_BODY_FRAME_COUNT: u32 = 5;
+const PLAYER_BODY_IDLE_FRAME: u32 = 5;
 const PLAYER_ARM_MIDDLE_FRAME: u32 = 1;
 const PLAYER_ARM_WALK_SEQUENCE: [u32; 4] = [0, 1, 0, 2];
 const PLAYER_ANIMATION_FRAME_TIME: f32 = 0.1;
@@ -193,7 +194,7 @@ pub fn update_player_animation(entities: &mut World, elapsed: f32) {
         sprite.frame = if walking {
             step as u32 % PLAYER_BODY_FRAME_COUNT
         } else {
-            0
+            PLAYER_BODY_IDLE_FRAME
         };
 
         if let Some(arm) = player.arm {
@@ -335,6 +336,25 @@ mod tests {
 
         assert_eq!(body_frames, [0, 1, 2, 3, 4]);
         assert_eq!(arm_frames, [0, 1, 0, 2, 0]);
+    }
+
+    #[test]
+    fn stationary_player_uses_the_dedicated_idle_body_frame() {
+        let mut entities = World::new();
+        let material = Handle {
+            index: 0,
+            generation: 0,
+            _marker: std::marker::PhantomData,
+        };
+        let player = spawn_player(&mut entities, material, material, [4.0, 4.0]);
+        entities.get::<&mut Collider>(player).unwrap().on_ground = true;
+
+        update_player_animation(&mut entities, 0.1);
+
+        assert_eq!(
+            entities.get::<&Sprite>(player).unwrap().frame,
+            PLAYER_BODY_IDLE_FRAME
+        );
     }
 
     #[test]

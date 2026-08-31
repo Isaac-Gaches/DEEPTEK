@@ -19,9 +19,13 @@ pub(crate) struct InputState {
     pub(super) cursor_position: [f32; 2],
     pub(super) primary_click_queued: Option<PointerClick>,
     pub(super) secondary_click_queued: Option<PointerClick>,
+    pub(super) interaction_queued: bool,
     pub(super) primary_down: bool,
     pub(super) primary_world_use_active: bool,
     pub(super) last_continuous_item_use: Instant,
+    pub(super) secondary_down: bool,
+    pub(super) secondary_world_use_active: bool,
+    pub(super) last_continuous_secondary_use: Instant,
 }
 
 impl Default for InputState {
@@ -32,9 +36,13 @@ impl Default for InputState {
             cursor_position: [0.0, 0.0],
             primary_click_queued: None,
             secondary_click_queued: None,
+            interaction_queued: false,
             primary_down: false,
             primary_world_use_active: false,
             last_continuous_item_use: Instant::now(),
+            secondary_down: false,
+            secondary_world_use_active: false,
+            last_continuous_secondary_use: Instant::now(),
         }
     }
 }
@@ -71,6 +79,10 @@ impl InputState {
         self.jump_queued = true;
     }
 
+    pub(crate) fn queue_interaction(&mut self) {
+        self.interaction_queued = true;
+    }
+
     pub(crate) fn move_cursor(&mut self, position: [f32; 2]) {
         self.cursor_position = position;
     }
@@ -92,11 +104,17 @@ impl InputState {
         self.primary_world_use_active = false;
     }
 
-    pub(crate) fn queue_secondary(&mut self, camera: &FollowCamera, viewport: [f32; 2]) {
+    pub(crate) fn press_secondary(&mut self, camera: &FollowCamera, viewport: [f32; 2]) {
+        self.secondary_down = true;
         self.secondary_click_queued = Some(PointerClick {
             pixel: self.cursor_position,
             world: camera.screen_to_world(self.cursor_position, viewport),
         });
+    }
+
+    pub(crate) fn release_secondary(&mut self) {
+        self.secondary_down = false;
+        self.secondary_world_use_active = false;
     }
 
     pub(crate) fn clear_focus(&mut self) {
@@ -104,8 +122,11 @@ impl InputState {
         self.jump_queued = false;
         self.primary_click_queued = None;
         self.secondary_click_queued = None;
+        self.interaction_queued = false;
         self.primary_down = false;
         self.primary_world_use_active = false;
+        self.secondary_down = false;
+        self.secondary_world_use_active = false;
     }
 }
 

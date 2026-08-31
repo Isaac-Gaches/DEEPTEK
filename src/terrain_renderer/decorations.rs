@@ -161,11 +161,17 @@ fn append_object_instances(object: &WorldObject, output: &mut Vec<DecorationInst
             let height = object.size()[1];
             output.reserve(usize::from(height));
             for segment in 0..height {
+                let visual_kind = match (segment == 0, segment + 1 == height) {
+                    (true, true) => 6,
+                    (true, false) => 5,
+                    (false, true) => 4,
+                    (false, false) => 3,
+                };
                 output.push(instance(
                     anchor.x,
                     anchor.y as f32 + f32::from(segment),
                     0,
-                    if segment + 1 == height { 4 } else { 3 },
+                    visual_kind,
                 ));
             }
         }
@@ -241,16 +247,10 @@ mod tests {
     }
 
     #[test]
-    fn powered_cable_uses_conductive_body_segments_and_one_terminal() {
+    fn powered_cable_renders_built_in_top_and_bottom_terminals() {
         let mut world = World::empty(8, 8, 0).unwrap();
         world
             .set_tile(2, 1, Layer::Foreground, ForegroundTile::STONE)
-            .unwrap();
-        world
-            .place_furniture(
-                crate::FurnitureObject::POWERED_CABLE_ANCHOR,
-                TilePos::new(2, 2),
-            )
             .unwrap();
         for _ in 0..3 {
             world
@@ -259,13 +259,13 @@ mod tests {
         }
 
         let mut instances = Vec::new();
-        append_object_instances(world.object_at(TilePos::new(2, 3)).unwrap(), &mut instances);
+        append_object_instances(world.object_at(TilePos::new(2, 2)).unwrap(), &mut instances);
         assert_eq!(
             instances
                 .iter()
                 .map(|instance| instance.visual_kind)
                 .collect::<Vec<_>>(),
-            vec![3, 3, 4]
+            vec![5, 3, 4]
         );
     }
 }

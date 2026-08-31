@@ -34,7 +34,7 @@ pub enum SlotClick {
     Secondary,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Inventory {
     slots: Vec<Option<ItemStack>>,
     selected_hotbar: usize,
@@ -78,6 +78,10 @@ impl ItemContainer {
 
     pub fn take_stack(&mut self, index: usize) -> Option<ItemStack> {
         self.slots.get_mut(index)?.take()
+    }
+
+    pub(crate) fn remove_item(&mut self, item: ItemId, quantity: u16) -> u16 {
+        remove_item_from_slots(&mut self.slots, item, quantity)
     }
 
     pub(crate) fn can_add(&self, item: ItemId, quantity: u16, max_stack: u16) -> bool {
@@ -193,7 +197,26 @@ impl Inventory {
         }
     }
 
+    pub(crate) fn from_saved_slots(
+        slots: Vec<Option<ItemStack>>,
+        selected_hotbar: usize,
+    ) -> Option<Self> {
+        (slots.len() == INVENTORY_SLOTS && selected_hotbar < HOTBAR_SLOTS).then_some(Self {
+            slots,
+            selected_hotbar,
+        })
+    }
+
     pub fn starter(registry: &ItemRegistry) -> Self {
+        let mut inventory = Self::new();
+        assert_eq!(inventory.add(ItemId::PICKAXE, 1, registry), 0);
+        assert_eq!(inventory.add(ItemId::ROPE, 100, registry), 0);
+        assert_eq!(inventory.add(ItemId::GLOW_STICK, 20, registry), 0);
+        inventory
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_loadout(registry: &ItemRegistry) -> Self {
         let mut inventory = Self::new();
         for (item, quantity) in [
             (ItemId::DIRT_BLOCK, 200),
@@ -213,10 +236,18 @@ impl Inventory {
             (ItemId::BATTERY, 10),
             (ItemId::ROPE, 200),
             (ItemId::POWERED_CABLE, 300),
-            (ItemId::POWERED_CABLE_ANCHOR, 25),
             (ItemId::CARGO_LIFT, 5),
             (ItemId::LIFT_STATION, 10),
             (ItemId::POWER_CONNECTOR, 100),
+            (ItemId::COMPOSITE_ASSEMBLER, 10),
+            (ItemId::RED_SHAFT_BORE, 5),
+            (ItemId::PROCUREMENT_TERMINAL, 1),
+            (ItemId::LASER_DRILL, 5),
+            (ItemId::AMMO_TURRET, 5),
+            (ItemId::DIRECTIONAL_SENTRY, 10),
+            (ItemId::TURRET_AMMO, 200),
+            (ItemId::SPIKES, 50),
+            (ItemId::DOOR, 10),
         ] {
             assert_eq!(inventory.add(item, quantity, registry), 0);
         }
@@ -246,6 +277,15 @@ impl Inventory {
 
     pub fn selected_stack(&self) -> Option<ItemStack> {
         self.slot(self.selected_hotbar)
+    }
+
+    pub fn quantity(&self, item: ItemId) -> u32 {
+        self.slots
+            .iter()
+            .flatten()
+            .filter(|stack| stack.item == item)
+            .map(|stack| u32::from(stack.quantity))
+            .sum()
     }
 
     /// Adds as much as possible and returns the quantity that did not fit.
@@ -294,6 +334,10 @@ impl Inventory {
         removed
     }
 
+    pub(crate) fn remove_item(&mut self, item: ItemId, quantity: u16) -> u16 {
+        remove_item_from_slots(&mut self.slots, item, quantity)
+    }
+
     pub fn consume_selected(&mut self, quantity: u16) -> u16 {
         self.remove_from_slot(self.selected_hotbar, quantity)
     }
@@ -313,6 +357,25 @@ impl Inventory {
             SlotClick::Secondary => secondary_click(slot, cursor, registry),
         }
     }
+}
+
+fn remove_item_from_slots(slots: &mut [Option<ItemStack>], item: ItemId, quantity: u16) -> u16 {
+    let mut remaining = quantity;
+    for slot in slots {
+        let Some(stack) = slot.as_mut().filter(|stack| stack.item == item) else {
+            continue;
+        };
+        let removed = remaining.min(stack.quantity);
+        stack.quantity -= removed;
+        remaining -= removed;
+        if stack.quantity == 0 {
+            *slot = None;
+        }
+        if remaining == 0 {
+            break;
+        }
+    }
+    quantity - remaining
 }
 
 impl Default for Inventory {
@@ -387,6 +450,16 @@ fn secondary_click(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn starter_inventory_contains_basic_exploration_equipment() {
+        let registry = ItemRegistry::with_built_ins();
+        let inventory = Inventory::starter(&registry);
+        assert_eq!(inventory.slot(0), ItemStack::new(ItemId::PICKAXE, 1));
+        assert_eq!(inventory.slot(1), ItemStack::new(ItemId::ROPE, 100));
+        assert_eq!(inventory.slot(2), ItemStack::new(ItemId::GLOW_STICK, 20));
+        assert!(inventory.slots()[3..].iter().all(Option::is_none));
+    }
 
     #[test]
     fn add_fills_existing_stacks_before_empty_slots() {
