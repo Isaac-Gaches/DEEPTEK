@@ -1,22 +1,42 @@
 //! Chunked terrain, ECS-driven entities, physics, and GPU rendering.
 
+#[path = "game/contracts.rs"]
 pub mod contracts;
+#[path = "game/delivery.rs"]
 pub mod delivery;
+#[path = "engine/entity/mod.rs"]
 pub mod entity;
+#[path = "render/entity_renderer/mod.rs"]
 pub mod entity_renderer;
+#[path = "game/content/mod.rs"]
+pub mod game_content;
+#[path = "render/gui/mod.rs"]
 pub mod gui;
+#[path = "engine/item_transport/mod.rs"]
 pub mod item_transport;
+#[path = "engine/items/mod.rs"]
 pub mod items;
+#[path = "game/machine_processing/mod.rs"]
 pub mod machine_processing;
+#[path = "game/orbital_export.rs"]
 pub mod orbital_export;
+#[path = "render/post_process/mod.rs"]
 pub mod post_process;
+#[path = "engine/power/mod.rs"]
 pub mod power;
+#[path = "render/render_common.rs"]
 mod render_common;
+#[path = "render/sky_renderer/mod.rs"]
 pub mod sky_renderer;
+#[path = "game/specialists/mod.rs"]
 pub mod specialists;
+#[path = "engine/terrain/mod.rs"]
 pub mod terrain;
+#[path = "render/terrain_renderer/mod.rs"]
 pub mod terrain_renderer;
+#[path = "game/transmissions.rs"]
 pub mod transmissions;
+#[path = "game/tutorial.rs"]
 pub mod tutorial;
 
 pub use contracts::{
@@ -32,15 +52,16 @@ pub use delivery::{
     machine_offer, spawn_delivery_crate,
 };
 pub use entity::{
-    Bomb, Collider, DynamicLight, EffectsMaterials, EffectsSystem, Energy, FollowCamera,
-    GLOWGNAT_MIN_MACHINERY_ATTENTION, Health, Lifeform, LifeformDefinition, LifeformId,
-    LifeformLocomotion, LifeformMaterials, LifeformSimulation, LifeformSimulationConfig,
-    LifeformSimulationUpdate, LifeformSpawnView, LifeformSystem, LifeformSystemError, Lifetime,
-    MAX_TURRET_ELEVATION_DEGREES, Particle, ParticleKind, PhysicsConfig, Player, PlayerInput,
-    Projectile, ProjectileSystem, SPIKE_CONTACT_DAMAGE, SPIKE_DAMAGE_INTERVAL_SECONDS,
-    SpikeDamageSystem, SpikeDamageUpdate, Sprite, Transform, TurretProjectile, TurretStats,
-    TurretSystem, Wallet, built_in_lifeform_definitions, entity_position, spawn_bomb,
-    spawn_glowstick, spawn_player, update_colliders, update_player_animation, update_players,
+    BUILT_IN_LIFEFORMS, Bomb, Collider, DynamicLight, EffectsMaterials, EffectsSystem, Energy,
+    FollowCamera, GLOWGNAT_MIN_MACHINERY_ATTENTION, Health, Lifeform, LifeformDefinition,
+    LifeformId, LifeformLocomotion, LifeformMaterials, LifeformSimulation,
+    LifeformSimulationConfig, LifeformSimulationUpdate, LifeformSpawnView, LifeformSystem,
+    LifeformSystemError, LifeformVisual, Lifetime, MAX_TURRET_ELEVATION_DEGREES, Particle,
+    ParticleKind, PhysicsConfig, Player, PlayerInput, Projectile, ProjectileSystem,
+    SPIKE_CONTACT_DAMAGE, SPIKE_DAMAGE_INTERVAL_SECONDS, SpikeDamageSystem, SpikeDamageUpdate,
+    Sprite, Transform, TurretProjectile, TurretStats, TurretSystem, Wallet,
+    built_in_lifeform_definitions, entity_position, spawn_bomb, spawn_glowstick, spawn_player,
+    update_colliders, update_player_animation, update_players,
 };
 pub use entity_renderer::{SpriteAtlasFrame, SpriteInstance, SpriteRenderer};
 pub use gui::{
@@ -67,7 +88,7 @@ pub use items::{
 };
 pub use machine_processing::{
     COMPOSITE_ASSEMBLY_INTERVAL, COMPOSITE_RECIPE, MachineProcessingSystem,
-    MachineProcessingUpdate, ProcessingRecipe,
+    MachineProcessingUpdate, ProcessingRecipe, processor_accepts_manual_input,
 };
 pub use orbital_export::{DEFAULT_ORBITAL_EXPORT_INTERVAL, ExportShipment, OrbitalExportSystem};
 pub use post_process::BloomRenderer;
@@ -87,38 +108,44 @@ pub use terrain::{
     AMMO_TURRET_DEFINITION, AMMO_TURRET_DEMAND_MILLI_PER_SECOND, AMMO_TURRET_SLOTS,
     BATTERY_CAPACITY_MILLI, BATTERY_DEFINITION, BED_DEFINITION, BUILT_IN_BLOCKS,
     BUILT_IN_DECORATIONS, BUILT_IN_FURNITURE, BackgroundTile, BiomeId, BiomeMap, BlockDamage,
-    BlockDefinition, BlockHealth, BrokenTile, CARGO_CONVEYOR_DEFINITION, CARGO_LIFT_DEFINITION,
-    CARGO_LIFT_DEMAND_MILLI_PER_SECOND, CARGO_LIFT_SLOTS, CARGO_LIFT_SPEED_MILLI_TILES_PER_SECOND,
-    CHEST_DEFINITION, CHUNK_SIZE, COMPOSITE_ASSEMBLER_DEFINITION,
-    COMPOSITE_ASSEMBLER_DEMAND_MILLI_PER_SECOND, COMPOSITE_ASSEMBLER_SLOTS, CargoLiftDirection,
-    Chunk, ChunkActivity, ChunkPos, DEFAULT_BLOCK_HEALTH, DEFAULT_MACHINE_HEALTH,
-    DIRECTIONAL_SENTRY_DEFINITION, DIRECTIONAL_SENTRY_DEMAND_MILLI_PER_SECOND, DOOR_DEFINITION,
-    DecorationDefinition, DecorationUpdate, DecorationVisual, ForegroundTile,
-    FurnitureConfiguration, FurnitureDefinition, FurnitureFacing, FurnitureInteraction,
-    FurnitureObject, FurnitureSupport, ItemTransportRole, LASER_BORE_DEFINITION,
+    BlockDefinition, BlockHealth, BoreBeamVisual, BrokenTile, CARGO_CONVEYOR_DEFINITION,
+    CARGO_LIFT_DEFINITION, CARGO_LIFT_DEMAND_MILLI_PER_SECOND, CARGO_LIFT_SLOTS,
+    CARGO_LIFT_SPEED_MILLI_TILES_PER_SECOND, CHEST_DEFINITION, CHUNK_SIZE,
+    COMPOSITE_ASSEMBLER_DEFINITION, COMPOSITE_ASSEMBLER_DEMAND_MILLI_PER_SECOND,
+    COMPOSITE_ASSEMBLER_SLOTS, CargoLiftDirection, Chunk, ChunkActivity, ChunkPos,
+    DEFAULT_BLOCK_HEALTH, DEFAULT_MACHINE_HEALTH, DIRECTIONAL_SENTRY_DEFINITION,
+    DIRECTIONAL_SENTRY_DEMAND_MILLI_PER_SECOND, DOOR_DEFINITION, DecorationDefinition,
+    DecorationUpdate, DecorationVisual, ForegroundTile, FurnitureBehavior, FurnitureConfiguration,
+    FurnitureDefinition, FurnitureFacing, FurnitureInteraction, FurnitureItem, FurnitureObject,
+    FurnitureOffer, FurnitureSupport, ItemTransportRole, LASER_BORE_DEFINITION,
     LASER_BORE_DEMAND_MILLI_PER_SECOND, LASER_BORE_MAX_LENGTH, LASER_BORE_SLOTS,
-    LASER_BORE_TICKS_PER_TILE, LASER_DRILL_DEFINITION, LASER_DRILL_DEMAND_MILLI_PER_SECOND,
-    LASER_DRILL_MAX_LENGTH, LASER_DRILL_SLOTS, LIFT_STATION_DEFINITION, LIFT_STATION_SLOTS,
-    LaserDrillAim, Layer, LiftStationConfiguration, LiftStationMode, MAX_SURVEY_ORE_TYPES,
-    MAX_VINE_LENGTH, MAX_WORLD_HEIGHT, MAX_WORLD_NAME_BYTES, MAX_WORLD_TILES, MAX_WORLD_WIDTH,
-    METRES_PER_TILE, MachineDamage, MachineHealth, NaturalObject, NatureSimulationConfig,
-    NatureUpdate, ORBITAL_EXPORT_DEMAND_MILLI_PER_SECOND, ORBITAL_EXPORT_LAUNCHER_DEFINITION,
-    ORBITAL_EXPORT_LAUNCHER_SLOTS, ObjectId, ObjectPlacementError, ObjectTypeId, OreEstimate,
-    POWER_CONNECTION_RANGE_HALF_TILES, POWER_CONNECTION_RANGE_TILES, POWER_CONNECTOR_DEFINITION,
-    POWER_CONNECTOR_RANGE_TILES, POWERED_CABLE_ANCHOR_DEFINITION, POWERED_CABLE_OBJECT,
-    PROCUREMENT_TERMINAL_DEFINITION, PYLON_DEFINITION, PlayerState, PowerRole,
-    RED_SHAFT_BORE_DEFINITION, RED_SHAFT_BORE_DEMAND_MILLI_PER_SECOND, RED_SHAFT_BORE_SLOTS,
-    RED_SHAFT_BORE_WIDTH, ROPE_OBJECT, RemovedObject, SEA_LEVEL_PERCENT, SOLAR_ARRAY_DEFINITION,
+    LASER_BORE_TICKS_PER_TILE, LASER_BORE_WIDTH, LASER_DRILL_DEFINITION,
+    LASER_DRILL_DEMAND_MILLI_PER_SECOND, LASER_DRILL_MAX_LENGTH, LASER_DRILL_SLOTS,
+    LIFT_STATION_DEFINITION, LIFT_STATION_SLOTS, LaserDrillAim, Layer, LiftStationConfiguration,
+    LiftStationMode, MAX_SURVEY_ORE_TYPES, MAX_VINE_LENGTH, MAX_WORLD_HEIGHT, MAX_WORLD_NAME_BYTES,
+    MAX_WORLD_TILES, MAX_WORLD_WIDTH, METRES_PER_TILE, MachineDamage, MachineHealth, NaturalObject,
+    NatureSimulationConfig, NatureUpdate, ORBITAL_EXPORT_DEMAND_MILLI_PER_SECOND,
+    ORBITAL_EXPORT_LAUNCHER_DEFINITION, ORBITAL_EXPORT_LAUNCHER_SLOTS, ObjectId,
+    ObjectPlacementError, ObjectTypeId, OreEstimate, POWER_CONNECTION_RANGE_HALF_TILES,
+    POWER_CONNECTION_RANGE_TILES, POWER_CONNECTOR_DEFINITION, POWER_CONNECTOR_RANGE_TILES,
+    POWERED_CABLE_ANCHOR_DEFINITION, POWERED_CABLE_OBJECT, PROCUREMENT_TERMINAL_DEFINITION,
+    PYLON_DEFINITION, PlayerState, PowerRole, RED_SHAFT_BORE_DEFINITION,
+    RED_SHAFT_BORE_DEMAND_MILLI_PER_SECOND, RED_SHAFT_BORE_SLOTS, RED_SHAFT_BORE_WIDTH,
+    ROPE_OBJECT, RemovedObject, SEA_LEVEL_PERCENT, SOLAR_ARRAY_DEFINITION,
     SOLAR_GENERATION_MILLI_PER_SECOND, SPIKES_DEFINITION, SUBSURFACE_SURVEY_DEPTH,
     SUBSURFACE_SURVEY_WIDTH, SUBSURFACE_SURVEYOR_DEFINITION,
     SUBSURFACE_SURVEYOR_DEMAND_MILLI_PER_SECOND, SubsurfaceSurvey, TURRET_DEFINITION,
-    TURRET_DEMAND_MILLI_PER_SECOND, TargetPriority, TileId, TilePos, World, WorldError,
-    WorldGenerator, WorldObject, background_tile_for, block_definition, decoration_definition,
-    furniture_definition,
+    TURRET_DEMAND_MILLI_PER_SECOND, TargetPriority, TileId, TilePos, VerticalBoreBehavior,
+    WORLD_REGION_SIZE, World, WorldError, WorldGenerator, WorldObject, background_tile_for,
+    block_definition, chunks_for_tile_radius, decoration_definition, furniture_definition,
 };
 pub use terrain_renderer::{
-    LightSource, LightingUpdateStats, MeshSyncStats, TerrainRenderConfig, TerrainRenderer,
-    TerrainVertex,
+    ChunkMeshData, LightSource, LightingUpdateStats, MeshSyncStats, TerrainRenderConfig,
+    TerrainRenderer, TerrainVertex, build_chunk_mesh, build_chunk_mesh_into,
+    lighting_tile_dimensions, prepare_lighting_window, update_lighting_window_cells,
 };
 pub use transmissions::{Transmission, TransmissionLog};
-pub use tutorial::{TUTORIAL_BRIEFING_DELAY_SECONDS, TutorialProgram};
+pub use tutorial::{
+    TUTORIAL_BRIEFING_DELAY_SECONDS, TUTORIAL_MISSIONS, TutorialMissionDefinition, TutorialProgram,
+    tutorial_mission_definition,
+};

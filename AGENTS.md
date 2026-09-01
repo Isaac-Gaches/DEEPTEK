@@ -5,20 +5,21 @@ performance-conscious; do not add unrelated gameplay or visual features unless a
 
 ## Architecture
 
-- `src/terrain`: fixed worlds up to 64 million cells (`10,000` max width,
-  `16,000` max depth), dense `64 × 64` chunks,
+- `src/engine/terrain`: fixed worlds up to 64 million cells (`10,000` max width,
+  `16,000` max depth), dense `32 × 32` chunks,
   foreground/background `u16` tile layers, deterministic parallel generation, and
-  checked RLE save/load. `objects.rs` owns persistent anchored decorations, spatial
+  checked RLE save/load. `objects/mod.rs` owns persistent anchored decorations, spatial
   indices, and the budgeted growth-event queue.
-- `src/terrain_renderer`: `easy-gpu` chunk meshes streamed around the player. Mesh
+- `src/render/terrain_renderer`: `easy-gpu` chunk meshes streamed around the player. Mesh
   generation is multithreaded; GPU creation/removal stays on the render thread.
   `decorations.rs` renders resident grass, pebbles, and vine segments as one lit
   instanced batch using `assets/decorations/deco.png`.
 - Marching-square UVs use the exact legacy 256-entry LUT in `lut.rs` and the original
   tile atlases under `assets/terrain`.
-- `src/terrain_renderer/lighting.rs`: the legacy compute-lighting model—occupancy,
+- `src/render/terrain_renderer/lighting.rs`: the legacy compute-lighting model—occupancy,
   sky/dynamic sources, 12 diffusion passes, smoothing, 2× upscale, and occlusion.
-- `src/main.rs`: minimal movable-camera demonstration only.
+- `src/game/app`: the playable binary shell. `session` coordinates simulation and rendering;
+  input, interaction, pause, and world-menu code remain separate from library systems.
 
 Terrain edits should go through `TerrainRenderer::set_tile`, or be followed by
 `mark_tile_dirty`, so neighbouring meshes and lighting are refreshed correctly.

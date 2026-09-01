@@ -77,11 +77,16 @@ enum Scenario {
     PowerLocalizedEdit,
     PowerDistribution,
     DrillTick,
+    LightingInput,
+    LightingInputMedium,
+    LightingLocalizedEdit,
+    TerrainChunkMesh,
+    TerrainEdits,
     CombinedFrame,
 }
 
 impl Scenario {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 14] = [
         Self::EntityPhysics,
         Self::LifeformAi,
         Self::MachineryLifeforms,
@@ -90,6 +95,11 @@ impl Scenario {
         Self::PowerLocalizedEdit,
         Self::PowerDistribution,
         Self::DrillTick,
+        Self::LightingInput,
+        Self::LightingInputMedium,
+        Self::LightingLocalizedEdit,
+        Self::TerrainChunkMesh,
+        Self::TerrainEdits,
         Self::CombinedFrame,
     ];
 
@@ -103,6 +113,11 @@ impl Scenario {
             "power-local-edit" => Some(Self::PowerLocalizedEdit),
             "power-distribution" => Some(Self::PowerDistribution),
             "drill-tick" => Some(Self::DrillTick),
+            "lighting-input" => Some(Self::LightingInput),
+            "lighting-input-medium" => Some(Self::LightingInputMedium),
+            "lighting-local-edit" => Some(Self::LightingLocalizedEdit),
+            "terrain-mesh" => Some(Self::TerrainChunkMesh),
+            "terrain-edits" => Some(Self::TerrainEdits),
             "combined-frame" => Some(Self::CombinedFrame),
             _ => None,
         }
@@ -118,6 +133,11 @@ impl Scenario {
             Self::PowerLocalizedEdit => "localized power edit",
             Self::PowerDistribution => "power distribution frame",
             Self::DrillTick => "1-second drill tick",
+            Self::LightingInput => "lighting input refresh",
+            Self::LightingInputMedium => "medium lighting input",
+            Self::LightingLocalizedEdit => "localized lighting input",
+            Self::TerrainChunkMesh => "terrain chunk mesh",
+            Self::TerrainEdits => "terrain edit batch",
             Self::CombinedFrame => "combined simulation frame",
         }
     }
@@ -237,7 +257,9 @@ fn print_help() {
            -h, --help                      Show this help\n\n\
          Scenarios:\n\
            entity-physics, lifeform-ai, machinery-lifeforms, active-chunks,\n\
-           power-rebuild, power-local-edit, power-distribution, drill-tick, combined-frame"
+           power-rebuild, power-local-edit, power-distribution, drill-tick,
+           lighting-input, lighting-input-medium, lighting-local-edit,
+           terrain-mesh, terrain-edits, combined-frame"
     );
 }
 

@@ -1,9 +1,10 @@
 use super::{Preset, Scenario, TimingSummary, measure};
 use deep_tek::{
-    Collider, ForegroundTile, FurnitureObject, Layer, LifeformDefinition, LifeformId,
-    LifeformSimulation, LifeformSimulationConfig, LifeformSpawnView, LifeformSystem,
-    NatureSimulationConfig, PhysicsConfig, PowerSystem, TilePos, Transform, World,
-    update_colliders,
+    BackgroundTile, CHUNK_SIZE, ChunkMeshData, ChunkPos, Collider, ForegroundTile, FurnitureObject,
+    Layer, LifeformDefinition, LifeformId, LifeformSimulation, LifeformSimulationConfig,
+    LifeformSpawnView, LifeformSystem, NatureSimulationConfig, PhysicsConfig, PowerSystem, TilePos,
+    Transform, World, build_chunk_mesh_into, prepare_lighting_window, update_colliders,
+    update_lighting_window_cells,
 };
 use easy_gpu::assets::Material;
 use easy_gpu::assets_manager::Handle;
@@ -25,6 +26,11 @@ pub(super) fn run_scenario(scenario: Scenario, preset: Preset) -> TimingSummary 
         Scenario::PowerLocalizedEdit => benchmark_power_local_edit(preset),
         Scenario::PowerDistribution => benchmark_power_distribution(preset),
         Scenario::DrillTick => benchmark_drill_tick(preset),
+        Scenario::LightingInput => benchmark_lighting_input(preset),
+        Scenario::LightingInputMedium => benchmark_lighting_input_medium(preset),
+        Scenario::LightingLocalizedEdit => benchmark_lighting_localized_edit(preset),
+        Scenario::TerrainChunkMesh => benchmark_terrain_chunk_mesh(preset),
+        Scenario::TerrainEdits => benchmark_terrain_edits(preset),
         Scenario::CombinedFrame => benchmark_combined_frame(preset),
     }
 }
@@ -233,6 +239,147 @@ fn benchmark_drill_tick(preset: Preset) -> TimingSummary {
     )
 }
 
+fn benchmark_lighting_input(preset: Preset) -> TimingSummary {
+    const HORIZONTAL_RADIUS: u32 = 3;
+    const VERTICAL_RADIUS: u32 = 2;
+    let world = representative_terrain(512, 384);
+    let mut occupancy = Vec::new();
+    let mut lights = Vec::new();
+    measure(
+        Scenario::LightingInput,
+        "256x192 tiles (High preset)".to_owned(),
+        preset,
+        || {
+            prepare_lighting_window(
+                &world,
+                [256.0, 192.0],
+                HORIZONTAL_RADIUS,
+                VERTICAL_RADIUS,
+                &mut occupancy,
+                &mut lights,
+            );
+            (occupancy.len(), lights.len())
+        },
+    )
+}
+
+fn benchmark_lighting_input_medium(preset: Preset) -> TimingSummary {
+    const HORIZONTAL_RADIUS: u32 = 2;
+    const VERTICAL_RADIUS: u32 = 1;
+    let world = representative_terrain(512, 384);
+    let mut occupancy = Vec::new();
+    let mut lights = Vec::new();
+    measure(
+        Scenario::LightingInputMedium,
+        "192x128 tiles (Medium preset)".to_owned(),
+        preset,
+        || {
+            prepare_lighting_window(
+                &world,
+                [256.0, 192.0],
+                HORIZONTAL_RADIUS,
+                VERTICAL_RADIUS,
+                &mut occupancy,
+                &mut lights,
+            );
+            (occupancy.len(), lights.len())
+        },
+    )
+}
+
+fn benchmark_lighting_localized_edit(preset: Preset) -> TimingSummary {
+    const HORIZONTAL_RADIUS: u32 = 3;
+    const VERTICAL_RADIUS: u32 = 2;
+    let mut world = representative_terrain(512, 384);
+    let anchor = [256.0, 192.0];
+    let changed = [TilePos::new(256, 192)];
+    let mut occupancy = Vec::new();
+    let mut lights = Vec::new();
+    prepare_lighting_window(
+        &world,
+        anchor,
+        HORIZONTAL_RADIUS,
+        VERTICAL_RADIUS,
+        &mut occupancy,
+        &mut lights,
+    );
+    let mut use_dirt = true;
+    measure(
+        Scenario::LightingLocalizedEdit,
+        "one edited cell in a 256x192 window".to_owned(),
+        preset,
+        || {
+            world
+                .set_tile(
+                    changed[0].x,
+                    changed[0].y,
+                    Layer::Foreground,
+                    if use_dirt {
+                        ForegroundTile::DIRT
+                    } else {
+                        ForegroundTile::STONE
+                    },
+                )
+                .expect("benchmark edit is in bounds");
+            use_dirt = !use_dirt;
+            update_lighting_window_cells(
+                &world,
+                anchor,
+                HORIZONTAL_RADIUS,
+                VERTICAL_RADIUS,
+                &changed,
+                &mut occupancy,
+                &mut lights,
+            )
+        },
+    )
+}
+
+fn benchmark_terrain_chunk_mesh(preset: Preset) -> TimingSummary {
+    let world = representative_terrain(CHUNK_SIZE as u32, CHUNK_SIZE as u32);
+    let mut mesh = ChunkMeshData::default();
+    measure(
+        Scenario::TerrainChunkMesh,
+        format!("one {CHUNK_SIZE}x{CHUNK_SIZE} foreground layer"),
+        preset,
+        || {
+            build_chunk_mesh_into(
+                &world,
+                ChunkPos { x: 0, y: 0 },
+                Layer::Foreground,
+                &mut mesh,
+            );
+            (mesh.vertices.len(), mesh.indices.len())
+        },
+    )
+}
+
+fn benchmark_terrain_edits(preset: Preset) -> TimingSummary {
+    const EDITS: u32 = 256;
+    let mut world = representative_terrain(512, 384);
+    let mut use_dirt = true;
+    measure(
+        Scenario::TerrainEdits,
+        format!("{EDITS} foreground edits across four chunks"),
+        preset,
+        || {
+            let tile = if use_dirt {
+                ForegroundTile::DIRT
+            } else {
+                ForegroundTile::STONE
+            };
+            for edit in 0..EDITS {
+                let x = 96 + edit % 128;
+                let y = 128 + edit / 128;
+                world
+                    .set_tile(x, y, Layer::Foreground, tile)
+                    .expect("benchmark edit is in bounds");
+            }
+            use_dirt = !use_dirt;
+        },
+    )
+}
+
 fn benchmark_combined_frame(preset: Preset) -> TimingSummary {
     let mut fixture = drill_world(preset.drills);
     let mut power = PowerSystem::new();
@@ -294,6 +441,29 @@ fn floor_world(width: u32, height: u32, floor_y: u32) -> World {
     world
 }
 
+fn representative_terrain(width: u32, height: u32) -> World {
+    let mut world = World::empty(width, height, 0x11A4_71A6).expect("valid benchmark world");
+    for y in 0..height {
+        for x in 0..width {
+            if y > height / 3 && !(x / 9 + y / 7).is_multiple_of(5) {
+                world
+                    .set_tile(x, y, Layer::Foreground, ForegroundTile::STONE)
+                    .expect("representative foreground coordinate is in bounds");
+            } else if y > height / 4 {
+                world
+                    .set_tile(x, y, Layer::Background, BackgroundTile::STONE_WALL)
+                    .expect("representative background coordinate is in bounds");
+            }
+            if y > height / 3 && (x + y * 3).is_multiple_of(257) {
+                world
+                    .set_tile(x, y, Layer::Foreground, ForegroundTile::ASTERITE)
+                    .expect("representative light coordinate is in bounds");
+            }
+        }
+    }
+    world
+}
+
 fn spawn_colliders(entities: &mut EntityWorld, count: usize, width: u32, floor_y: u32) {
     for index in 0..count {
         entities.spawn((
@@ -324,7 +494,10 @@ fn active_chunk_world(count: usize) -> World {
         world
             .place_furniture(
                 FurnitureObject::CARGO_CONVEYOR,
-                TilePos::new((chunk_x * 64 + 8) as u32, (chunk_y * 64 + 8) as u32),
+                TilePos::new(
+                    (chunk_x * deep_tek::CHUNK_SIZE + 8) as u32,
+                    (chunk_y * deep_tek::CHUNK_SIZE + 8) as u32,
+                ),
             )
             .expect("one free-standing conveyor fits in each chunk");
     }

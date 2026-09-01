@@ -37,7 +37,7 @@ control.
 | A/D or Left/Right | Move |
 | Space | Jump |
 | W/S | Climb ropes and powered cables |
-| E | Interact, or open inventory when no interaction is available |
+| X | Interact, or open inventory when no interaction is available |
 | I | Toggle inventory |
 | 1–0 or mouse wheel | Select hotbar slot |
 | Left click | Use the selected item or operate inventory slots |
@@ -47,8 +47,9 @@ control.
 | Tab | Toggle world map |
 | Escape | Close the current window or pause |
 
-The pause menu contains Low, Medium, and High render-distance settings. The maximum
-camera zoom-out automatically scales to the selected streaming distance and viewport.
+The pause menu contains Medium and High render-distance settings tuned for bounded lighting
+textures on integrated GPUs. The maximum camera zoom-out automatically scales to the selected
+streaming distance and viewport.
 
 ## Gameplay overview
 
@@ -73,24 +74,24 @@ be used by the player to pass the night.
 
 ## Architecture
 
-- `src/terrain` owns fixed chunked worlds, deterministic generation, foreground and
+- `src/engine/terrain` owns fixed chunked worlds, deterministic generation, foreground and
   background tiles, persistent objects, structures, biomes, durability, surveys, nature,
   and checked save/load.
-- `src/terrain_renderer` streams terrain meshes around the player and renders furniture,
+- `src/render/terrain_renderer` streams terrain meshes around the player and renders furniture,
   decorations, the 8-bit light map, and occlusion. Mesh preparation is multithreaded;
   GPU resource changes remain on the render thread.
-- `src/entity` contains ECS components and systems for the player, physics, effects,
+- `src/engine/entity` contains ECS components and systems for the player, physics, effects,
   lifeforms, hazards, projectiles, and turrets.
-- `src/items` contains item definitions, inventory, crafting, dropped items, and item-use
+- `src/engine/items` contains item mechanics, inventory, dropped items, and item-use
   dispatch.
-- `src/gui` contains retained batched interfaces for the HUD, inventory, contracts,
+- `src/render/gui` contains retained batched interfaces for the HUD, inventory, contracts,
   transmissions, procurement, specialists, and world map.
-- `src/demo` integrates the library systems into the playable application, including
-  menus, input, interaction, save jobs, and runtime rendering.
-- Top-level systems such as `power`, `item_transport`, `machine_processing`, `delivery`,
-  `orbital_export`, `specialists`, and `tutorial` remain independent of rendering.
+- `src/game/app` is the thin playable-application shell: menus, input, interaction, save
+  jobs, frame orchestration, and runtime rendering.
+- `src/game/content` is the authoring entry point for built-in definitions. Other game
+  modules contain processing, delivery, contracts, specialists, and tutorial rules.
 
-Worlds use dense `64 × 64` chunks with separate `u16` foreground and background planes.
+Worlds use dense `32 × 32` chunks with separate `u16` foreground and background planes.
 The supported ceiling is 10,000 tiles wide, 16,000 tiles deep, and 64 million cells.
 Generation is deterministic across worker counts. Saves use versioned, checksummed RLE
 sections and validate dimensions, runs, object relationships, and trailing data before
@@ -104,6 +105,9 @@ Simulation systems operate on world state rather than visible chunks.
 
 See [Adding content](docs/adding-content.md) for the registries and validation steps used
 to add blocks, furniture, machines, decorations, and lifeforms.
+
+See [Architecture](docs/architecture.md) for the complete source layout, dependency
+boundaries, module conventions, and guidance on where new code belongs.
 
 See [Stress benchmarks](docs/stress-benchmarks.md) for benchmark commands, presets, and
 how to interpret the simulation timing report.
